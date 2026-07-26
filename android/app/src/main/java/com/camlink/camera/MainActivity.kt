@@ -48,6 +48,7 @@ class MainActivity : Activity(), HubClient.Listener {
     private var dimOverlay: View? = null
     private var waitingForSmartUsbFallback = false
     private var discoveringLanHub = false
+    private var validatingProfiles = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -96,6 +97,10 @@ class MainActivity : Activity(), HubClient.Listener {
         root.addView(Button(this).apply {
             text = "Find hub on Wi-Fi"
             setOnClickListener { discoverAndConnect() }
+        })
+        root.addView(Button(this).apply {
+            text = "Validate camera profiles"
+            setOnClickListener { validateCameraProfiles() }
         })
         root.addView(Button(this).apply {
             text = "Check for updates"
@@ -186,6 +191,59 @@ class MainActivity : Activity(), HubClient.Listener {
                 if (showNoUpdate) setConnectStatus("Update check failed: $message", true)
             }
         )
+    }
+
+    /** Runs only from the connection screen, so it never competes with the live Camera2 pipeline. */
+    private fun validateCameraProfiles() {
+        if (!hasCameraPermission()) {
+            requestCameraPermissionIfNeeded()
+            return
+        }
+        if (validatingProfiles) {
+            setConnectStatus("Camera profile validation is already running.")
+            return
+        }
+        validatingProfiles = true
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        setConnectStatus("Scanning Camera2 and encoder candidates before validation…")
+        Thread {
+            try {
+                val detectedCapabilities = CameraCapabilityProbe(this).inspect()
+                CameraProfileValidator(this).validateAll(
+                    detectedCapabilities,
+                    onProgress = { completed, total, camera, profile ->
+                        runOnUiThread {
+                            setConnectStatus("Validating ${completed + 1}/$total: ${camera.name} ${profile.width}×${profile.height} @ ${profile.fps} fps")
+                        }
+                    },
+                    onComplete = { reports ->
+                        runOnUiThread {
+                            validatingProfiles = false
+                            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                            val verified = reports.count { it.status == ProfileVerification.VERIFIED }
+                            val unstable = reports.count { it.status == ProfileVerification.UNSTABLE }
+                            val unsupported = reports.count { it.status == ProfileVerification.UNSUPPORTED }
+                            val firstIssue = reports.firstOrNull { it.status != ProfileVerification.VERIFIED }?.message
+                            setConnectStatus(
+                                "Profile validation complete: $verified verified, $unstable unstable, $unsupported unsupported." +
+                                    (firstIssue?.let { " First issue: $it" } ?: "") +
+                                    " Reconnect to refresh the profile list.",
+                                unstable > 0 || unsupported > 0
+                            )
+                        }
+                    }
+                )
+            } catch (exception: Exception) {
+                runOnUiThread {
+                    validatingProfiles = false
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    setConnectStatus("Camera profile validation failed: ${exception.message}", true)
+                }
+            }
+        }.apply {
+            name = "CamLinkProfileScan"
+            start()
+        }
     }
 
     private fun showCameraMode(detectedCapabilities: CameraCapabilities, endpoint: String) {
@@ -855,9 +913,13 @@ class MainActivity : Activity(), HubClient.Listener {
     }
 
     private fun CameraDescriptor.defaultLiveProfile(): CameraProfile? = profiles
-        .filter { !it.highSpeed && it.codec == "h264" }
-        .sortedWith(compareByDescending<CameraProfile> { it.width == 1920 && it.height == 1080 && it.fps == 60 }
-            .thenByDescending { it.width == 1920 && it.height == 1080 }
+        .filter { !it.highSpeed && it.codec == "h264" && it.verification != ProfileVerification.UNSUPPORTED }
+        // Do not make an untested Camera2-only candidate the automatic stream.
+        // Once validated, 1080p60 is preferred, followed by 4K30 and the stable 1080p30 fallback.
+        .sortedWith(compareByDescending<CameraProfile> { it.verification == ProfileVerification.VERIFIED || it.source == ProfileSource.CAMCORDER_HINT }
+            .thenByDescending { it.verification == ProfileVerification.VERIFIED && it.width == 1920 && it.height == 1080 && it.fps == 60 }
+            .thenByDescending { it.verification == ProfileVerification.VERIFIED && it.width >= 3840 && it.fps == 30 }
+            .thenByDescending { it.width == 1920 && it.height == 1080 && it.fps == 30 }
             .thenByDescending { it.width.toLong() * it.height }
             .thenByDescending { it.fps })
         .firstOrNull()

@@ -65,8 +65,6 @@ internal sealed class MainForm : Form
         AddRow(controls, "Camera", _camera);
         AddRow(controls, "Profile", _profile);
         AddRow(controls, "White balance", _whiteBalance);
-        _focusMode.Items.AddRange(["Continuous video", "Auto", "Locked / manual"]);
-        _focusMode.SelectedIndex = 0;
         AddRow(controls, "Focus", _focusMode);
         AddRow(controls, "Zoom", _zoom);
         AddRow(controls, "Exposure EV steps", _exposure);
@@ -237,6 +235,13 @@ internal sealed class MainForm : Form
         }
         _suppressEvents = true;
         _profile.DataSource = camera.Profiles;
+        _whiteBalance.DataSource = camera.WhiteBalanceModes;
+        _whiteBalance.SelectedIndex = Math.Max(0, camera.WhiteBalanceModes.ToList().IndexOf("Auto"));
+        _focusMode.DataSource = camera.FocusModes;
+        _focusMode.SelectedIndex = Math.Max(0, camera.FocusModes.ToList().FindIndex(mode => mode.Value == 0));
+        _exposure.Minimum = camera.ExposureMin;
+        _exposure.Maximum = camera.ExposureMax;
+        _exposure.Value = Math.Clamp(0, camera.ExposureMin, camera.ExposureMax);
         _zoom.Maximum = Math.Max(10, (int)Math.Ceiling(camera.MaxZoom * 10));
         _zoom.Value = 10;
         _torch.Enabled = camera.HasFlash;
@@ -256,9 +261,9 @@ internal sealed class MainForm : Form
         ? Task.CompletedTask
         : SendAsync("setWhiteBalance", mode);
 
-    private Task OnFocusModeChangedAsync() => _suppressEvents
+    private Task OnFocusModeChangedAsync() => _suppressEvents || _focusMode.SelectedItem is not FocusModeOption mode
         ? Task.CompletedTask
-        : SendAsync("setFocusMode", _focusMode.SelectedIndex);
+        : SendAsync("setFocusMode", mode.Value);
 
     private Task OnZoomChangedAsync() => _suppressEvents
         ? Task.CompletedTask
@@ -293,13 +298,10 @@ internal sealed class MainForm : Form
         _capabilities = capabilities;
         _suppressEvents = true;
         _camera.DataSource = capabilities.Cameras;
-        _whiteBalance.DataSource = capabilities.WhiteBalanceModes;
-        _exposure.Minimum = capabilities.ExposureMin;
-        _exposure.Maximum = capabilities.ExposureMax;
-        _exposure.Value = Math.Clamp(0, capabilities.ExposureMin, capabilities.ExposureMax);
         _suppressEvents = false;
         if (_camera.Items.Count > 0)
         {
+            _camera.SelectedIndex = -1;
             _camera.SelectedIndex = 0;
         }
         _connectionStatus.Text = $"Phone ready: {capabilities.DeviceName}. Profiles shown are reported by Android Camera2.";

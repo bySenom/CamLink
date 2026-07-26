@@ -4,7 +4,7 @@ CamLink makes an Android phone a remotely controlled, low-latency camera for OBS
 
 ## What is implemented
 
-- Native Android Camera2 capture, including front/rear selection, ultra-wide/wide/tele discovery, zoom, focus mode, exposure compensation, device-supported auto-white-balance presets and torch.
+- Native Android Camera2 capture, including front/rear selection, ultra-wide/wide/tele discovery, zoom, focus mode, exposure compensation, device-supported auto-white-balance presets and torch. Camera2 candidates are merged with (rather than hidden by) CamcorderProfile hints, then validated against a concrete hardware encoder.
 - H.264 hardware encoding and HEVC/H.265 fallback for camera sizes that the phone cannot encode as H.264 (normally relevant to 8K), over a private local TCP link.
 - Windows companion with remote controls and an OBS-backed Windows virtual camera. Select **OBS Virtual Camera** as a Video Capture Device in OBS, Discord, Teams, Zoom, and similar applications.
 - USB setup helper (`scripts/camlink-usb.ps1`) using `adb reverse`; Wi-Fi is supported directly. With both devices on the same trusted Wi-Fi, the app finds the hub automatically—no PC IP is required. Smart mode tries USB first, then performs the Wi-Fi search.
@@ -16,6 +16,8 @@ CamLink makes an Android phone a remotely controlled, low-latency camera for OBS
 The S22 camera application, encoder and thermal state decide which combinations can actually be opened. CamLink queries Android's `StreamConfigurationMap`, advertised high-speed modes and normal FPS ranges, then exposes only candidates returned by the phone. The camera start is the final validation because an encoder surface can impose a tighter limit than a raw camera output.
 
 In particular, do not assume that every S22 variant offers 8K/30 or 1080p/120 through third-party Camera2 capture. Samsung firmware can expose its own Camera app modes without exposing the same mode to third-party apps. When Camera2 rejects a requested profile, CamLink keeps the error visible and offers the next verified profile; it never silently records at a different setting.
+
+Use **Validate camera profiles** in the Android connection screen to test each candidate locally and cache it as verified, unstable, or unsupported. See [camera-validation.md](docs/camera-validation.md) for the test procedure and Logcat filters.
 
 ## Project layout
 

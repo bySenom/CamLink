@@ -29,6 +29,7 @@ class CameraPipeline(
     private val hub: HubClient
 ) {
     private val manager = context.getSystemService(CameraManager::class.java)
+    private val encoders = VideoEncoderProbe()
     private val cameraThread = HandlerThread("CamLinkCamera").apply { start() }
     private val handler = Handler(cameraThread.looper)
     private val lock = Any()
@@ -155,12 +156,10 @@ class CameraPipeline(
     }
 
     private fun prepareEncoder(config: StreamConfiguration) {
-        val bitrate = chooseBitrate(config.width, config.height, config.fps)
-        val mime = when (config.codec) {
-            "h264" -> MediaFormat.MIMETYPE_VIDEO_AVC
-            "h265" -> MediaFormat.MIMETYPE_VIDEO_HEVC
-            else -> throw UnsupportedOperationException("Unsupported video codec ${config.codec}.")
-        }
+        val selection = encoders.select(config.codec, android.util.Size(config.width, config.height), config.fps)
+            ?: throw UnsupportedOperationException("No ${config.codec} encoder supports ${config.width}x${config.height}@${config.fps}.")
+        val bitrate = chooseBitrate(config, selection)
+        val mime = selection.mime
         val format = MediaFormat.createVideoFormat(mime, config.width, config.height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
@@ -170,7 +169,7 @@ class CameraPipeline(
                 setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
             }
         }
-        encoder = MediaCodec.createEncoderByType(mime).apply {
+        encoder = MediaCodec.createByCodecName(selection.name).apply {
             setCallback(encoderCallback, handler)
             configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             encoderSurface = createInputSurface()
@@ -178,9 +177,21 @@ class CameraPipeline(
         }
     }
 
-    private fun chooseBitrate(width: Int, height: Int, fps: Int): Int {
-        val megabits = (width.toLong() * height * fps * 0.09 / 1_000_000.0).toInt()
-        return max(8, megabits).coerceAtMost(120) * 1_000_000
+    private fun chooseBitrate(config: StreamConfiguration, encoder: VideoEncoderSelection): Int {
+        val megabits = when {
+            // 8K needs an intentionally high HEVC budget. A blanket HEVC multiplier
+            // would make it look encodable while visibly starving the stream.
+            config.width >= 7680 -> if (config.codec == "h265") 80 else 120
+            config.width >= 3840 && config.fps >= 60 -> if (config.codec == "h265") 70 else 100
+            config.width >= 3840 -> if (config.codec == "h265") 42 else 55
+            config.width >= 2560 && config.fps >= 60 -> if (config.codec == "h265") 32 else 48
+            config.width >= 2560 -> if (config.codec == "h265") 22 else 32
+            config.width >= 1920 && config.fps >= 60 -> if (config.codec == "h265") 18 else 28
+            config.width >= 1920 -> if (config.codec == "h265") 11 else 16
+            config.fps >= 60 -> if (config.codec == "h265") 10 else 16
+            else -> if (config.codec == "h265") 7 else 10
+        }
+        return (megabits * 1_000_000).coerceIn(encoder.minBitrate, encoder.maxBitrate)
     }
 
     private val encoderCallback = object : MediaCodec.Callback() {
@@ -224,7 +235,7 @@ class CameraPipeline(
         }
 
         override fun onError(codec: MediaCodec, exception: MediaCodec.CodecException) {
-            hub.sendStatus("H.264 encoder error: ${exception.diagnosticInfo}", error = true)
+            hub.sendStatus("Video encoder error: ${exception.diagnosticInfo}", error = true)
         }
     }
 
