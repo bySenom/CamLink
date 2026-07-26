@@ -7,8 +7,10 @@ import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.SurfaceTexture
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
+import android.text.TextUtils
 import android.view.Gravity
 import android.view.TextureView
 import android.view.View
@@ -22,7 +24,6 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.Spinner
-import android.widget.Switch
 import android.widget.TextView
 import org.json.JSONObject
 import kotlin.math.roundToInt
@@ -206,63 +207,93 @@ class MainActivity : Activity(), HubClient.Listener {
 
         val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         cameraRoot = root
-        val cameraPreview = TextureView(this).apply {
+        val cameraPreview = AspectRatioTextureView(this).apply {
             id = PREVIEW_ID
             isOpaque = true
         }
-        root.addView(cameraPreview, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        root.addView(cameraPreview, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER))
         preview = cameraPreview
+
+        val header = LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            background = roundedSurface(0xe619202b.toInt(), dp(18))
+        }
+        header.addView(TextView(this).apply {
+            text = "●"
+            textSize = 18f
+            setTextColor(0xff49e07f.toInt())
+        })
+        cameraStatus = TextView(this).apply {
+            text = "Preparing ${defaultCamera.name}"
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            maxLines = 1
+            setPadding(dp(8), 0, 0, 0)
+        }
+        header.addView(cameraStatus, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(header, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP).apply {
+            setMargins(dp(16), dp(12), dp(16), 0)
+        })
 
         val overlay = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            setBackgroundColor(0xc9000000.toInt())
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            background = roundedSurface(0xe919202b.toInt(), dp(20))
         }
-        cameraStatus = TextView(this).apply {
-            text = "Connected through $endpoint · preparing ${defaultCamera.name}"
-            setTextColor(Color.WHITE)
-            textSize = 14f
-        }
-        overlay.addView(cameraStatus)
 
         val cameraSpinner = Spinner(this)
         val profileSpinner = Spinner(this)
         val whiteBalanceSpinner = Spinner(this)
         val focusSpinner = Spinner(this)
-        val zoom = SeekBar(this)
-        val exposure = SeekBar(this)
-        val torch = Switch(this).apply { text = "Light"; setTextColor(Color.WHITE) }
-        val zoomValue = TextView(this).apply { setTextColor(Color.WHITE) }
-        val exposureValue = TextView(this).apply { setTextColor(Color.WHITE) }
+        val zoom = SeekBar(this).apply { contentDescription = "Zoom" }
+        val exposure = SeekBar(this).apply { contentDescription = "Exposure" }
+        val zoomValue = valueChip()
+        val exposureValue = valueChip()
+        listOf(cameraSpinner, profileSpinner, whiteBalanceSpinner, focusSpinner).forEach { spinner ->
+            spinner.background = roundedSurface(0xff273343.toInt(), dp(12))
+            spinner.setPadding(dp(6), 0, dp(4), 0)
+        }
 
-        overlay.addView(controlRow("Lens", cameraSpinner, "Profile", profileSpinner))
-        overlay.addView(controlRow("White balance", whiteBalanceSpinner, "Focus", focusSpinner))
-        overlay.addView(controlRow("Zoom", zoom, "", zoomValue))
-        overlay.addView(controlRow("Exposure", exposure, "", exposureValue))
         overlay.addView(LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            addView(torch)
-            addView(Button(this@MainActivity).apply {
-                text = "Black screen"
-                setOnClickListener { setDisplayDimmed(true) }
-            })
-            addView(Button(this@MainActivity).apply {
-                text = "Disconnect"
-                setOnClickListener { returnToConnectScreen() }
-            })
+            addView(iconTile("◉", "Lens", cameraSpinner), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(0, 0, dp(5), 0) })
+            addView(iconTile("▣", "Video profile", profileSpinner), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(dp(5), 0, dp(5), 0) })
+            addView(iconTile("☀", "White balance", whiteBalanceSpinner), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(dp(5), 0, dp(5), 0) })
+            addView(iconTile("◎", "Focus mode", focusSpinner), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(dp(5), 0, 0, 0) })
         })
-        root.addView(overlay, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
+
+        val torch = iconButton("☼", "Torch / fill light")
+        fun updateTorchButton(enabled: Boolean) {
+            torch.isSelected = enabled
+            torch.background = iconBackground(enabled)
+            torch.alpha = if (torch.isEnabled) 1f else 0.35f
+        }
+        val dim = iconButton("◐", "Dim screen without locking")
+        val disconnect = iconButton("×", "Disconnect", destructive = true)
+        overlay.addView(LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(6), 0, 0)
+            addView(adjustmentControl("⌕", "Zoom", zoom, zoomValue), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(adjustmentControl("±", "Exposure", exposure, exposureValue), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(dp(8), 0, dp(8), 0) })
+            addView(torch, LinearLayout.LayoutParams(dp(44), dp(44)).apply { setMargins(0, 0, dp(6), 0) })
+            addView(dim, LinearLayout.LayoutParams(dp(44), dp(44)).apply { setMargins(0, 0, dp(6), 0) })
+            addView(disconnect, LinearLayout.LayoutParams(dp(44), dp(44)))
+        })
+        root.addView(overlay, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM).apply {
+            setMargins(dp(16), 0, dp(16), dp(14))
+        })
 
         pipeline?.release()
         pipeline = CameraPipeline(this, cameraPreview, hub)
         setContentView(root)
 
         updatingControls = true
-        cameraSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, detectedCapabilities.cameras)
+        cameraSpinner.adapter = darkSpinnerAdapter(detectedCapabilities.cameras)
         cameraSpinner.setSelection(detectedCapabilities.cameras.indexOf(defaultCamera).coerceAtLeast(0))
         loadProfiles(profileSpinner, defaultCamera, defaultProfile)
-        whiteBalanceSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, detectedCapabilities.whiteBalanceModes)
-        focusSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, listOf("Continuous video", "Auto focus", "Locked focus"))
+        whiteBalanceSpinner.adapter = darkSpinnerAdapter(detectedCapabilities.whiteBalanceModes)
+        focusSpinner.adapter = darkSpinnerAdapter(listOf("Continuous video", "Auto focus", "Locked focus"))
         zoom.max = ((defaultCamera.maxZoom - 1f) * 10f).roundToInt().coerceAtLeast(1)
         zoom.progress = 0
         zoomValue.text = "1.0×"
@@ -270,6 +301,7 @@ class MainActivity : Activity(), HubClient.Listener {
         exposure.progress = (0 - detectedCapabilities.exposureMin).coerceIn(0, exposure.max)
         exposureValue.text = "0 EV"
         torch.isEnabled = defaultCamera.hasFlash
+        updateTorchButton(false)
         updatingControls = false
 
         cameraSpinner.onItemSelectedListener = itemSelectionListener { _, position ->
@@ -284,7 +316,7 @@ class MainActivity : Activity(), HubClient.Listener {
             zoom.progress = 0
             zoomValue.text = "1.0×"
             torch.isEnabled = camera.hasFlash
-            torch.isChecked = false
+            updateTorchButton(false)
             updatingControls = false
             startSelectedCamera()
         }
@@ -310,32 +342,107 @@ class MainActivity : Activity(), HubClient.Listener {
             exposureValue.text = "$ev EV"
             applyCameraCommand("setExposure", ev)
         })
-        torch.setOnCheckedChangeListener { _, enabled ->
-            if (!updatingControls) applyCameraCommand("setTorch", enabled)
+        torch.setOnClickListener {
+            if (!torch.isEnabled) return@setOnClickListener
+            updateTorchButton(!torch.isSelected)
+            applyCameraCommand("setTorch", torch.isSelected)
         }
 
         cameraPreview.post { startSelectedCamera() }
     }
 
-    private fun controlRow(leftLabel: String, leftControl: View, rightLabel: String, rightControl: View): View {
+    private fun iconTile(icon: String, description: String, control: View): View {
         return LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            val labelParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.18f)
-            val controlParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.32f)
-            addView(TextView(this@MainActivity).apply { text = leftLabel; setTextColor(Color.WHITE); textSize = 12f }, labelParams)
-            addView(leftControl, controlParams)
-            if (rightLabel.isNotBlank()) {
-                addView(TextView(this@MainActivity).apply { text = rightLabel; setTextColor(Color.WHITE); textSize = 12f }, labelParams)
-            } else {
-                addView(View(this@MainActivity), labelParams)
-            }
-            addView(rightControl, controlParams)
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(7), dp(4), dp(7), dp(4))
+            background = roundedSurface(0x401e2b3b, dp(14))
+            addView(TextView(this@MainActivity).apply {
+                text = icon
+                textSize = 17f
+                contentDescription = description
+                setTextColor(0xffb8c7da.toInt())
+                gravity = Gravity.CENTER
+            })
+            addView(control, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
     }
 
+    private fun adjustmentControl(icon: String, description: String, control: View, value: TextView): View {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            contentDescription = description
+            addView(TextView(this@MainActivity).apply {
+                text = icon
+                textSize = 20f
+                setTextColor(0xffb8c7da.toInt())
+                gravity = Gravity.CENTER
+            }, LinearLayout.LayoutParams(dp(28), dp(36)))
+            addView(control, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(value, LinearLayout.LayoutParams(dp(48), dp(30)).apply { setMargins(dp(4), 0, 0, 0) })
+        }
+    }
+
+    private fun valueChip(): TextView = TextView(this).apply {
+        gravity = Gravity.CENTER
+        textSize = 12f
+        setTextColor(Color.WHITE)
+        maxLines = 1
+        background = roundedSurface(0xff33465b.toInt(), dp(10))
+    }
+
+    private fun iconButton(symbol: String, description: String, destructive: Boolean = false): TextView = TextView(this).apply {
+        text = symbol
+        textSize = 23f
+        gravity = Gravity.CENTER
+        contentDescription = description
+        isClickable = true
+        isFocusable = true
+        setTextColor(if (destructive) 0xffff9d9d.toInt() else Color.WHITE)
+        background = iconBackground(active = false, destructive = destructive)
+    }
+
+    private fun iconBackground(active: Boolean, destructive: Boolean = false): GradientDrawable = roundedSurface(
+        when {
+            destructive -> 0xff62333a.toInt()
+            active -> 0xff1769aa.toInt()
+            else -> 0xff2a394b.toInt()
+        },
+        dp(14)
+    )
+
+    private fun roundedSurface(color: Int, radius: Int): GradientDrawable = GradientDrawable().apply {
+        setColor(color)
+        cornerRadius = radius.toFloat()
+    }
+
+    private fun <T> darkSpinnerAdapter(items: List<T>): ArrayAdapter<T> = object : ArrayAdapter<T>(
+        this,
+        android.R.layout.simple_spinner_item,
+        items
+    ) {
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View =
+            styleSpinnerText(super.getView(position, convertView, parent), popup = false)
+
+        override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View =
+            styleSpinnerText(super.getDropDownView(position, convertView, parent), popup = true)
+    }
+
+    private fun styleSpinnerText(view: View, popup: Boolean): View {
+        (view as? TextView)?.apply {
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(9), dp(7), dp(9), dp(7))
+            if (popup) background = roundedSurface(0xff202b38.toInt(), dp(8))
+        }
+        return view
+    }
+
     private fun loadProfiles(spinner: Spinner, camera: CameraDescriptor, selected: CameraProfile) {
-        spinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, camera.profiles)
+        spinner.adapter = darkSpinnerAdapter(camera.profiles)
         spinner.setSelection(camera.profiles.indexOf(selected).coerceAtLeast(0))
     }
 
@@ -343,7 +450,8 @@ class MainActivity : Activity(), HubClient.Listener {
         val camera = selectedCamera ?: return
         val profile = selectedProfile ?: return
         val config = StreamConfiguration(camera.id, profile.width, profile.height, profile.fps, profile.highSpeed, profile.codec)
-        cameraStatus?.text = "Starting ${camera.name} · $profile"
+        (preview as? AspectRatioTextureView)?.setAspectRatio(profile.width, profile.height)
+        cameraStatus?.text = "${camera.name}  ·  ${profile.width}×${profile.height}  ·  ${profile.fps} fps"
         startCameraService()
         val cameraPreview = preview ?: return
         val start = { pipeline?.start(config) }
