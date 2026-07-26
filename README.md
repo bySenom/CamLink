@@ -7,7 +7,7 @@ CamLink makes an Android phone a remotely controlled, low-latency camera for OBS
 - Native Android Camera2 capture, including front/rear selection, ultra-wide/wide/tele discovery, zoom, focus mode, exposure compensation, device-supported auto-white-balance presets and torch.
 - H.264 hardware encoding and HEVC/H.265 fallback for camera sizes that the phone cannot encode as H.264 (normally relevant to 8K), over a private local TCP link.
 - Windows companion with remote controls and an OBS-backed Windows virtual camera. Select **OBS Virtual Camera** as a Video Capture Device in OBS, Discord, Teams, Zoom, and similar applications.
-- USB setup helper (`scripts/camlink-usb.ps1`) using `adb reverse`; Wi-Fi is supported directly. Smart mode tries USB first, then the configured Wi-Fi address.
+- USB setup helper (`scripts/camlink-usb.ps1`) using `adb reverse`; Wi-Fi is supported directly. With both devices on the same trusted Wi-Fi, the app finds the hub automatically—no PC IP is required. Smart mode tries USB first, then performs the Wi-Fi search.
 - GitHub Releases update checks for both the Hub and phone app. The Hub can download, verify and restart into an update; Android downloads the APK and opens the required system installation confirmation.
 - Bluetooth is deliberately excluded as a video transport: its bandwidth and latency are insufficient for HD, let alone 4K/8K. This first build leaves Bluetooth pairing/control as the next optional extension; video uses USB or Wi-Fi.
 
@@ -38,7 +38,7 @@ docs/                 Protocol and operating notes
 1. Install Android Studio and SDK Platform 35. Create `android/local.properties` with `sdk.dir=C:\\Users\\<you>\\AppData\\Local\\Android\\Sdk`.
 2. Build the phone app with [scripts/build-android.ps1](scripts/build-android.ps1), then install it with [scripts/install-s22-debug.ps1](scripts/install-s22-debug.ps1).
 3. Start the Windows companion with [scripts/start-desktop.ps1](scripts/start-desktop.ps1).
-4. **USB:** enable Developer options and USB debugging on the phone, connect it, then run `powershell -ExecutionPolicy Bypass -File scripts/camlink-usb.ps1`. **Wi-Fi:** enter the PC's LAN IPv4 address in the phone app.
+4. **USB:** enable Developer options and USB debugging on the phone, connect it, then run `powershell -ExecutionPolicy Bypass -File scripts/camlink-usb.ps1`. **Wi-Fi:** connect both devices to the same trusted Wi-Fi, start the Hub, and choose **Find hub on Wi-Fi** in the phone app (or leave the address blank in **Smart**). A manual PC IPv4 address remains available as a fallback.
 5. In the phone app, select **Smart** or **USB**, then press **Connect**. After capability discovery, CamLink enters the full-screen camera view, locks the current rotation, and starts a stream-safe back-camera profile automatically. Camera, profile, zoom, focus, white balance, exposure, and light remain available as overlays on the phone and in the companion.
 6. Run [scripts/configure-obs-virtual-camera.ps1](scripts/configure-obs-virtual-camera.ps1) once, then start OBS with the generated CamLink profile (the companion’s **Start Windows camera** button does this when no other OBS instance is open). Select **OBS Virtual Camera** in the target application. The local RTSP endpoint remains an internal bridge for the dedicated OBS collection.
 

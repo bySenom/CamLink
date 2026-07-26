@@ -10,6 +10,7 @@ internal sealed class MainForm : Form
     private const int RtspPort = 8554;
     private readonly HubServer _hub = new();
     private readonly RtspServer _rtsp;
+    private readonly LanDiscoveryService _lanDiscovery = new(HubPort);
     private readonly Label _connectionStatus = new() { AutoSize = true, Text = "Hub stopped", ForeColor = Color.DarkRed };
     private readonly Label _virtualCameraStatus = new() { AutoSize = true, Text = "Windows camera: OBS Virtual Camera (waiting for the phone stream)" };
     private readonly ComboBox _camera = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 270 };
@@ -107,6 +108,7 @@ internal sealed class MainForm : Form
         };
         FormClosing += async (_, _) =>
         {
+            await _lanDiscovery.DisposeAsync();
             await _rtsp.DisposeAsync();
             await _hub.DisposeAsync();
         };
@@ -126,9 +128,10 @@ internal sealed class MainForm : Form
         {
             await _hub.StartAsync(HubPort);
             await _rtsp.StartAsync(RtspPort);
+            await _lanDiscovery.StartAsync();
             var usbBridge = await AdbUsbBridge.ConfigureReverseAsync(HubPort);
             var usbStatus = usbBridge.Success ? "USB forwarding ready." : $"USB setup: {usbBridge.Message}";
-            _connectionStatus.Text = $"Waiting for phone on TCP {HubPort} — Wi-Fi address: {FindLanAddress()} — {usbStatus}";
+            _connectionStatus.Text = $"Waiting for phone on TCP {HubPort} — Wi-Fi address: {FindLanAddress()} — LAN discovery ready — {usbStatus}";
             _connectionStatus.ForeColor = Color.DarkBlue;
         }
         catch (Exception exception)

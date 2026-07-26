@@ -43,6 +43,8 @@ class MainActivity : Activity(), HubClient.Listener {
     private var updatingControls = false
     private var cameraRoot: FrameLayout? = null
     private var dimOverlay: View? = null
+    private var waitingForSmartUsbFallback = false
+    private var discoveringLanHub = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -78,8 +80,7 @@ class MainActivity : Activity(), HubClient.Listener {
             adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, listOf("Smart (USB then Wi-Fi)", "USB", "Wi-Fi", "Bluetooth control only"))
         }
         hostInput = EditText(this).apply {
-            hint = "Windows PC LAN IP (for Wi-Fi / Smart fallback)"
-            setText("192.168.")
+            hint = "Windows PC LAN IP (optional)"
             inputType = android.text.InputType.TYPE_CLASS_TEXT
         }
         root.addView(transport)
@@ -87,6 +88,10 @@ class MainActivity : Activity(), HubClient.Listener {
         root.addView(Button(this).apply {
             text = "Connect to Windows companion"
             setOnClickListener { connect() }
+        })
+        root.addView(Button(this).apply {
+            text = "Find hub on Wi-Fi"
+            setOnClickListener { discoverAndConnect() }
         })
         root.addView(Button(this).apply {
             text = "Check for updates"
@@ -107,17 +112,55 @@ class MainActivity : Activity(), HubClient.Listener {
         }
         val host = hostInput.text.toString().trim()
         when (transport.selectedItemPosition) {
-            0 -> hub.connectSmart(host, HUB_PORT, this)
-            1 -> hub.connectUsb(HUB_PORT, this)
-            2 -> {
-                if (host.isBlank() || host == "192.168.") {
-                    setConnectStatus("Enter the Windows PC's LAN IPv4 address first.", true)
-                    return
+            0 -> {
+                if (host.isBlank()) {
+                    waitingForSmartUsbFallback = true
+                    setConnectStatus("Trying USB first. Wi-Fi search starts automatically if USB is unavailable.")
+                    hub.connectUsb(HUB_PORT, this)
+                } else {
+                    hub.connectSmart(host, HUB_PORT, this)
                 }
-                hub.connectWifi(host, HUB_PORT, this)
+            }
+            1 -> {
+                waitingForSmartUsbFallback = false
+                hub.connectUsb(HUB_PORT, this)
+            }
+            2 -> {
+                if (host.isBlank()) discoverAndConnect() else hub.connectWifi(host, HUB_PORT, this)
             }
             else -> setConnectStatus("Bluetooth is reserved for pairing/control. Use USB or Wi-Fi for the video session.", true)
         }
+    }
+
+    private fun discoverAndConnect() {
+        if (!hasCameraPermission()) {
+            requestCameraPermissionIfNeeded()
+            return
+        }
+        if (discoveringLanHub) {
+            setConnectStatus("Wi-Fi hub search is already running.")
+            return
+        }
+        waitingForSmartUsbFallback = false
+        discoveringLanHub = true
+        setConnectStatus("Searching for CamLink Hub on this Wi-Fi…")
+        LanHubDiscovery(this).find(
+            onFound = { endpoint ->
+                runOnUiThread {
+                    discoveringLanHub = false
+                    hostInput.setText(endpoint.host)
+                    transport.setSelection(2)
+                    setConnectStatus("Hub found at ${endpoint.host}. Connecting…")
+                    hub.connectWifi(endpoint.host, endpoint.port, this)
+                }
+            },
+            onNotFound = { message ->
+                runOnUiThread {
+                    discoveringLanHub = false
+                    setConnectStatus(message, true)
+                }
+            }
+        )
     }
 
     private fun checkForUpdates(showNoUpdate: Boolean) {
@@ -391,6 +434,7 @@ class MainActivity : Activity(), HubClient.Listener {
     }
 
     override fun onConnected(endpoint: String) {
+        waitingForSmartUsbFallback = false
         Thread {
             try {
                 val capabilityProbe = CameraCapabilityProbe(this)
@@ -405,7 +449,10 @@ class MainActivity : Activity(), HubClient.Listener {
 
     override fun onDisconnected(message: String) {
         runOnUiThread {
-            if (cameraMode) {
+            if (waitingForSmartUsbFallback && !cameraMode) {
+                waitingForSmartUsbFallback = false
+                discoverAndConnect()
+            } else if (cameraMode) {
                 returnToConnectScreen(message, true)
             } else {
                 setConnectStatus(message, true)
