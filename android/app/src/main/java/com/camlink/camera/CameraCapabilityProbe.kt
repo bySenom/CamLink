@@ -6,6 +6,7 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.params.StreamConfigurationMap
+import android.media.CamcorderProfile
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
@@ -14,6 +15,7 @@ import android.util.Range
 import android.util.Size
 import org.json.JSONArray
 import org.json.JSONObject
+import kotlin.math.abs
 import kotlin.math.max
 
 class CameraCapabilityProbe(context: Context) {
@@ -57,7 +59,7 @@ class CameraCapabilityProbe(context: Context) {
             name = name,
             maxZoom = max(1f, zoom),
             hasFlash = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true,
-            profiles = normalProfiles(map, characteristics) + highSpeedProfiles(map, characteristics)
+            profiles = recorderProfiles(id, map).ifEmpty { normalProfiles(map, characteristics) } + highSpeedProfiles(map, characteristics)
         )
     }
 
@@ -76,12 +78,39 @@ class CameraCapabilityProbe(context: Context) {
                 if (!containsFps(fpsRanges, fps) || !canReachFps(map, size, fps)) {
                     null
                 } else {
-                    val codec = encoders.codecFor(size) ?: return@mapNotNull null
+                    val codec = encoders.codecFor(size, fps) ?: return@mapNotNull null
                     CameraProfile(size.width, size.height, fps, highSpeed = false, codec = codec)
                 }
             }
         }
-            .filter { profile -> profile.width >= 1280 && profile.height >= 720 }
+            .filter { profile -> profile.width >= 1280 && profile.height >= 720 && isVideoAspect(profile.width, profile.height) }
+            .sortedWith(compareByDescending<CameraProfile> { it.width.toLong() * it.height }.thenByDescending { it.fps })
+            .distinctBy { Triple(it.width, it.height, it.fps) }
+    }
+
+    /** Vendor-validated recorder combinations for this exact camera ID. */
+    private fun recorderProfiles(cameraId: String, map: StreamConfigurationMap): List<CameraProfile> {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return emptyList()
+        val supportedSizes = map.getOutputSizes(SurfaceTexture::class.java)?.toSet().orEmpty()
+        val qualities = listOf(
+            CamcorderProfile.QUALITY_8KUHD,
+            CamcorderProfile.QUALITY_4KDCI,
+            CamcorderProfile.QUALITY_2160P,
+            CamcorderProfile.QUALITY_2K,
+            CamcorderProfile.QUALITY_1080P,
+            CamcorderProfile.QUALITY_720P,
+            CamcorderProfile.QUALITY_480P
+        )
+        return qualities.flatMap { quality ->
+            val profiles = runCatching { CamcorderProfile.getAll(cameraId, quality) }.getOrNull() ?: return@flatMap emptyList()
+            profiles.videoProfiles.mapNotNull { video ->
+                val size = Size(video.width, video.height)
+                if (size !in supportedSizes || !isVideoAspect(size.width, size.height)) return@mapNotNull null
+                val codec = encoders.codecFor(size, video.frameRate) ?: return@mapNotNull null
+                CameraProfile(size.width, size.height, video.frameRate, highSpeed = false, codec = codec)
+            }
+        }
+            .filter { it.width >= 1280 && it.height >= 720 }
             .sortedWith(compareByDescending<CameraProfile> { it.width.toLong() * it.height }.thenByDescending { it.fps })
             .distinctBy { Triple(it.width, it.height, it.fps) }
     }
@@ -95,7 +124,7 @@ class CameraCapabilityProbe(context: Context) {
             map.getHighSpeedVideoFpsRangesFor(size)
                 .filter { it.lower == 120 && it.upper == 120 }
                 .mapNotNull {
-                    val codec = encoders.codecFor(size) ?: return@mapNotNull null
+                    val codec = encoders.codecFor(size, 120) ?: return@mapNotNull null
                     CameraProfile(size.width, size.height, 120, highSpeed = true, codec = codec)
                 }
         }
@@ -122,6 +151,11 @@ class CameraCapabilityProbe(context: Context) {
         minimumDurationNs == 0L || minimumDurationNs <= 1_000_000_000L / fps
     } catch (_: IllegalArgumentException) {
         false
+    }
+
+    private fun isVideoAspect(width: Int, height: Int): Boolean {
+        val ratio = width.toFloat() / height.toFloat()
+        return abs(ratio - 16f / 9f) < 0.03f || abs(ratio - 17f / 9f) < 0.03f
     }
 
     fun asJson(capabilities: CameraCapabilities): JSONObject = JSONObject().apply {
@@ -155,20 +189,23 @@ class CameraCapabilityProbe(context: Context) {
 }
 
 private class VideoEncoderProbe {
-    private val h264 = encoderFor(MediaFormat.MIMETYPE_VIDEO_AVC)
-    private val h265 = encoderFor(MediaFormat.MIMETYPE_VIDEO_HEVC)
+    private val h264 = encodersFor(MediaFormat.MIMETYPE_VIDEO_AVC)
+    private val h265 = encodersFor(MediaFormat.MIMETYPE_VIDEO_HEVC)
 
-    fun codecFor(size: Size): String? = when {
-        supports(h264, MediaFormat.MIMETYPE_VIDEO_AVC, size) -> "h264"
-        supports(h265, MediaFormat.MIMETYPE_VIDEO_HEVC, size) -> "h265"
+    fun codecFor(size: Size, fps: Int): String? = when {
+        supports(h264, MediaFormat.MIMETYPE_VIDEO_AVC, size, fps) -> "h264"
+        supports(h265, MediaFormat.MIMETYPE_VIDEO_HEVC, size, fps) -> "h265"
         else -> null
     }
 
-    private fun encoderFor(mime: String): MediaCodecInfo? = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
-        .firstOrNull { it.isEncoder && it.supportedTypes.any { supported -> supported.equals(mime, ignoreCase = true) } }
+    private fun encodersFor(mime: String): List<MediaCodecInfo> = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+        .filter { it.isEncoder && it.supportedTypes.any { supported -> supported.equals(mime, ignoreCase = true) } }
 
-    private fun supports(info: MediaCodecInfo?, mime: String, size: Size): Boolean = try {
-        info?.getCapabilitiesForType(mime)?.videoCapabilities?.isSizeSupported(size.width, size.height) == true
+    private fun supports(infos: List<MediaCodecInfo>, mime: String, size: Size, fps: Int): Boolean = try {
+        infos.any { info ->
+            info.getCapabilitiesForType(mime).videoCapabilities
+                ?.areSizeAndRateSupported(size.width, size.height, fps.toDouble()) == true
+        }
     } catch (_: IllegalArgumentException) {
         false
     }
