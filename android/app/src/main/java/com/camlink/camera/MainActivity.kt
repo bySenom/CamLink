@@ -15,6 +15,8 @@ import android.view.Gravity
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
@@ -56,6 +58,7 @@ class MainActivity : Activity(), HubClient.Listener {
 
     override fun onDestroy() {
         setDisplayDimmed(false)
+        restoreSystemBars()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         hub.close()
         pipeline?.release()
@@ -186,6 +189,146 @@ class MainActivity : Activity(), HubClient.Listener {
     }
 
     private fun showCameraMode(detectedCapabilities: CameraCapabilities, endpoint: String) {
+        val defaultCamera = detectedCapabilities.cameras.firstOrNull { it.name.startsWith("Wide") }
+            ?: detectedCapabilities.cameras.firstOrNull { !it.name.startsWith("Front") }
+            ?: detectedCapabilities.cameras.firstOrNull()
+            ?: run {
+                setConnectStatus("No Camera2 video camera is available.", true)
+                return
+            }
+        val defaultProfile = defaultCamera.defaultLiveProfile() ?: run {
+            setConnectStatus("The selected camera has no encodable video profile.", true)
+            return
+        }
+
+        cameraMode = true
+        capabilities = detectedCapabilities
+        selectedCamera = defaultCamera
+        selectedProfile = defaultProfile
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        cameraRoot = root
+        val cameraPreview = AspectRatioTextureView(this).apply {
+            id = PREVIEW_ID
+            isOpaque = true
+        }
+        root.addView(cameraPreview, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        preview = cameraPreview
+
+        cameraStatus = TextView(this).apply {
+            text = "●  preparing"
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            background = roundedSurface(0xc918202b.toInt(), dp(18))
+        }
+        root.addView(cameraStatus, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START).apply {
+            setMargins(dp(16), dp(16), 0, 0)
+        })
+
+        var zoomRatio = 1f
+        var exposureEv = 0
+        var whiteBalanceIndex = 0
+        var focusMode = 0
+        val toolbar = LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(6), dp(6), dp(6), dp(6))
+            background = roundedSurface(0xe61a2330.toInt(), dp(24))
+        }
+        fun addTool(button: TextView) {
+            toolbar.addView(button, LinearLayout.LayoutParams(dp(44), dp(44)).apply {
+                setMargins(dp(2), 0, dp(2), 0)
+            })
+        }
+
+        val lens = iconButton("◎", "Lens")
+        val profile = iconButton("▣", "Video profile")
+        val whiteBalance = iconButton("◌", "White balance")
+        val focus = iconButton("⊙", "Focus mode")
+        val zoom = iconButton("⌕", "Zoom")
+        val exposure = iconButton("±", "Exposure")
+        val torch = iconButton("✦", "Torch / fill light")
+        val dim = iconButton("◐", "Dim screen without locking")
+        val disconnect = iconButton("×", "Disconnect", destructive = true)
+        fun updateTorchButton(enabled: Boolean) {
+            torch.isSelected = enabled
+            torch.background = iconBackground(enabled)
+            torch.alpha = if (torch.isEnabled) 1f else 0.35f
+        }
+        torch.isEnabled = defaultCamera.hasFlash
+        updateTorchButton(false)
+
+        listOf(lens, profile, whiteBalance, focus, zoom, exposure, torch, dim, disconnect).forEach(::addTool)
+        root.addView(toolbar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+            setMargins(0, 0, 0, dp(16))
+        })
+
+        pipeline?.release()
+        pipeline = CameraPipeline(this, cameraPreview, hub)
+        setContentView(root)
+
+        lens.setOnClickListener {
+            showChoiceDialog("Lens", detectedCapabilities.cameras, detectedCapabilities.cameras.indexOf(selectedCamera)) { camera ->
+                if (camera.id == selectedCamera?.id) return@showChoiceDialog
+                selectedCamera = camera
+                selectedProfile = camera.defaultLiveProfile()
+                zoomRatio = 1f
+                torch.isEnabled = camera.hasFlash
+                updateTorchButton(false)
+                startSelectedCamera()
+            }
+        }
+        profile.setOnClickListener {
+            val camera = selectedCamera ?: return@setOnClickListener
+            showChoiceDialog("Video profile", camera.profiles, camera.profiles.indexOf(selectedProfile)) { selected ->
+                if (selected == selectedProfile) return@showChoiceDialog
+                selectedProfile = selected
+                startSelectedCamera()
+            }
+        }
+        whiteBalance.setOnClickListener {
+            showChoiceDialog("White balance", detectedCapabilities.whiteBalanceModes, whiteBalanceIndex) { selected ->
+                whiteBalanceIndex = detectedCapabilities.whiteBalanceModes.indexOf(selected)
+                applyCameraCommand("setWhiteBalance", selected)
+            }
+        }
+        focus.setOnClickListener {
+            val choices = listOf("Continuous video", "Auto focus", "Locked focus")
+            showChoiceDialog("Focus", choices, focusMode) { selected ->
+                focusMode = choices.indexOf(selected)
+                applyCameraCommand("setFocusMode", focusMode)
+            }
+        }
+        zoom.setOnClickListener {
+            val maximum = ((selectedCamera?.maxZoom ?: 1f) * 10f).roundToInt().coerceAtLeast(10)
+            showSliderDialog("Zoom", 10, maximum, (zoomRatio * 10f).roundToInt(), { "%.1f×".format(it / 10f) }) { value ->
+                zoomRatio = value / 10f
+                applyCameraCommand("setZoom", zoomRatio)
+            }
+        }
+        exposure.setOnClickListener {
+            showSliderDialog("Exposure", detectedCapabilities.exposureMin, detectedCapabilities.exposureMax, exposureEv, { "$it EV" }) { value ->
+                exposureEv = value
+                applyCameraCommand("setExposure", exposureEv)
+            }
+        }
+        torch.setOnClickListener {
+            if (!torch.isEnabled) return@setOnClickListener
+            updateTorchButton(!torch.isSelected)
+            applyCameraCommand("setTorch", torch.isSelected)
+        }
+        dim.setOnClickListener { setDisplayDimmed(true) }
+        disconnect.setOnClickListener { returnToConnectScreen() }
+
+        cameraPreview.post {
+            hideSystemBarsForCamera()
+            startSelectedCamera()
+        }
+    }
+
+    private fun showLegacyCameraMode(detectedCapabilities: CameraCapabilities, endpoint: String) {
         val defaultCamera = detectedCapabilities.cameras.firstOrNull { it.name.startsWith("Wide") }
             ?: detectedCapabilities.cameras.firstOrNull { !it.name.startsWith("Front") }
             ?: detectedCapabilities.cameras.firstOrNull()
@@ -441,6 +584,88 @@ class MainActivity : Activity(), HubClient.Listener {
         return view
     }
 
+    private fun <T> showChoiceDialog(title: String, choices: List<T>, selectedIndex: Int, onSelected: (T) -> Unit) {
+        if (choices.isEmpty()) return
+        android.app.AlertDialog.Builder(this)
+            .setTitle(title)
+            .setSingleChoiceItems(
+                choices.map { it.toString() }.toTypedArray(),
+                selectedIndex.coerceIn(0, choices.lastIndex)
+            ) { dialog, index ->
+                onSelected(choices[index])
+                dialog.dismiss()
+            }
+            .show()
+    }
+
+    private fun showSliderDialog(
+        title: String,
+        minimum: Int,
+        maximum: Int,
+        current: Int,
+        format: (Int) -> String,
+        onChanged: (Int) -> Unit
+    ) {
+        val range = (maximum - minimum).coerceAtLeast(0)
+        val value = TextView(this).apply {
+            text = format(current.coerceIn(minimum, maximum))
+            textSize = 18f
+            gravity = Gravity.CENTER
+            setPadding(0, dp(6), 0, dp(4))
+        }
+        val slider = SeekBar(this).apply {
+            max = range
+            progress = (current - minimum).coerceIn(0, range)
+            setPadding(dp(24), 0, dp(24), 0)
+        }
+        slider.setOnSeekBarChangeListener(seekListener { progress ->
+            val selected = minimum + progress
+            value.text = format(selected)
+            onChanged(selected)
+        })
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            addView(value)
+            addView(slider)
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle(title)
+            .setView(content)
+            .setPositiveButton("Done", null)
+            .show()
+    }
+
+    private fun hideSystemBarsForCamera() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(false)
+            window.insetsController?.apply {
+                hide(WindowInsets.Type.systemBars())
+                systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = (
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                    or View.SYSTEM_UI_FLAG_FULLSCREEN
+                    or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                )
+        }
+    }
+
+    private fun restoreSystemBars() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.insetsController?.show(WindowInsets.Type.systemBars())
+            window.setDecorFitsSystemWindows(true)
+        } else {
+            @Suppress("DEPRECATION")
+            run { window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE }
+        }
+    }
+
     private fun loadProfiles(spinner: Spinner, camera: CameraDescriptor, selected: CameraProfile) {
         spinner.adapter = darkSpinnerAdapter(camera.profiles)
         spinner.setSelection(camera.profiles.indexOf(selected).coerceAtLeast(0))
@@ -451,7 +676,7 @@ class MainActivity : Activity(), HubClient.Listener {
         val profile = selectedProfile ?: return
         val config = StreamConfiguration(camera.id, profile.width, profile.height, profile.fps, profile.highSpeed, profile.codec)
         (preview as? AspectRatioTextureView)?.setAspectRatio(profile.width, profile.height)
-        cameraStatus?.text = "${camera.name}  ·  ${profile.width}×${profile.height}  ·  ${profile.fps} fps"
+        cameraStatus?.text = "●  ${profile.height}p  ·  ${profile.fps} fps"
         startCameraService()
         val cameraPreview = preview ?: return
         val start = { pipeline?.start(config) }
@@ -493,6 +718,7 @@ class MainActivity : Activity(), HubClient.Listener {
         selectedCamera = null
         selectedProfile = null
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        restoreSystemBars()
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         setContentView(createConnectContent())
         cameraRoot = null

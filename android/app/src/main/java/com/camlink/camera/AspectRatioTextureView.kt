@@ -1,11 +1,12 @@
 package com.camlink.camera
 
 import android.content.Context
+import android.graphics.Matrix
 import android.util.AttributeSet
 import android.view.TextureView
-import kotlin.math.roundToInt
+import kotlin.math.max
 
-/** A centre-cropped-free TextureView: the whole camera frame stays visible and never stretches. */
+/** Full-bleed camera preview that centre-crops instead of ever stretching a video frame. */
 class AspectRatioTextureView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null
@@ -17,28 +18,26 @@ class AspectRatioTextureView @JvmOverloads constructor(
         if (width <= 0 || height <= 0 || (frameWidth == width && frameHeight == height)) return
         frameWidth = width
         frameHeight = height
-        requestLayout()
+        applyCenterCrop()
     }
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-        val availableWidth = MeasureSpec.getSize(widthMeasureSpec)
-        val availableHeight = MeasureSpec.getSize(heightMeasureSpec)
-        if (frameWidth == 0 || frameHeight == 0 || availableWidth == 0 || availableHeight == 0) {
-            super.onMeasure(widthMeasureSpec, heightMeasureSpec)
-            return
-        }
+        setMeasuredDimension(MeasureSpec.getSize(widthMeasureSpec), MeasureSpec.getSize(heightMeasureSpec))
+    }
 
-        val frameRatio = frameWidth.toFloat() / frameHeight.toFloat()
-        val availableRatio = availableWidth.toFloat() / availableHeight.toFloat()
-        val measuredWidth: Int
-        val measuredHeight: Int
-        if (availableRatio > frameRatio) {
-            measuredHeight = availableHeight
-            measuredWidth = (measuredHeight * frameRatio).roundToInt()
-        } else {
-            measuredWidth = availableWidth
-            measuredHeight = (measuredWidth / frameRatio).roundToInt()
-        }
-        setMeasuredDimension(measuredWidth, measuredHeight)
+    override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
+        super.onSizeChanged(width, height, oldWidth, oldHeight)
+        applyCenterCrop()
+    }
+
+    private fun applyCenterCrop() {
+        if (frameWidth == 0 || frameHeight == 0 || width == 0 || height == 0) return
+        val scale = max(width.toFloat() / frameWidth, height.toFloat() / frameHeight)
+        val scaledWidth = frameWidth * scale
+        val scaledHeight = frameHeight * scale
+        setTransform(Matrix().apply {
+            setScale(scale, scale)
+            postTranslate((width - scaledWidth) / 2f, (height - scaledHeight) / 2f)
+        })
     }
 }
