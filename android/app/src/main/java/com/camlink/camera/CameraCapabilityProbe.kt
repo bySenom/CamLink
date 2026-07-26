@@ -1,0 +1,175 @@
+package com.camlink.camera
+
+import android.content.Context
+import android.graphics.SurfaceTexture
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraMetadata
+import android.hardware.camera2.params.StreamConfigurationMap
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
+import android.media.MediaFormat
+import android.os.Build
+import android.util.Range
+import android.util.Size
+import org.json.JSONArray
+import org.json.JSONObject
+import kotlin.math.max
+
+class CameraCapabilityProbe(context: Context) {
+    private val manager = context.getSystemService(CameraManager::class.java)
+    private val encoders = VideoEncoderProbe()
+
+    fun inspect(): CameraCapabilities {
+        val cameras = manager.cameraIdList.mapNotNull { id ->
+            val characteristics = manager.getCameraCharacteristics(id)
+            descriptor(id, characteristics)
+        }.sortedBy { it.name }
+
+        val reference = cameras.firstOrNull()?.let { manager.getCameraCharacteristics(it.id) }
+        val exposureRange = reference?.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE) ?: Range(0, 0)
+        return CameraCapabilities(
+            deviceName = "${Build.MANUFACTURER} ${Build.MODEL}",
+            cameras = cameras,
+            exposureMin = exposureRange.lower,
+            exposureMax = exposureRange.upper,
+            whiteBalanceModes = whiteBalanceModes(reference)
+        )
+    }
+
+    private fun descriptor(id: String, characteristics: CameraCharacteristics): CameraDescriptor {
+        val map = requireNotNull(characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)) {
+            "Camera $id does not expose a stream configuration map."
+        }
+        val focal = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.minOrNull() ?: 0f
+        val name = if (characteristics.get(CameraCharacteristics.LENS_FACING) == CameraMetadata.LENS_FACING_FRONT) {
+            "Front (${String.format("%.1f", focal)} mm)"
+        } else {
+            cameraName(focal)
+        }
+        val zoom = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.upper ?: 1f
+        } else {
+            characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
+        }
+        return CameraDescriptor(
+            id = id,
+            name = name,
+            maxZoom = max(1f, zoom),
+            hasFlash = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true,
+            profiles = normalProfiles(map, characteristics) + highSpeedProfiles(map, characteristics)
+        )
+    }
+
+    private fun cameraName(focalMm: Float): String = when {
+        focalMm <= 2.0f -> "Ultra-wide (${String.format("%.1f", focalMm)} mm)"
+        focalMm >= 6.0f -> "Telephoto (${String.format("%.1f", focalMm)} mm)"
+        else -> "Wide (${String.format("%.1f", focalMm)} mm)"
+    }
+
+    private fun normalProfiles(map: StreamConfigurationMap, characteristics: CameraCharacteristics): List<CameraProfile> {
+        val fpsRanges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.toList().orEmpty()
+        val outputSizes = map.getOutputSizes(SurfaceTexture::class.java)?.toList().orEmpty()
+        val requestedFps = listOf(30, 60)
+        return outputSizes.flatMap { size ->
+            requestedFps.mapNotNull { fps ->
+                if (!containsFps(fpsRanges, fps) || !canReachFps(map, size, fps)) {
+                    null
+                } else {
+                    val codec = encoders.codecFor(size) ?: return@mapNotNull null
+                    CameraProfile(size.width, size.height, fps, highSpeed = false, codec = codec)
+                }
+            }
+        }
+            .filter { profile -> profile.width >= 1280 && profile.height >= 720 }
+            .sortedWith(compareByDescending<CameraProfile> { it.width.toLong() * it.height }.thenByDescending { it.fps })
+            .distinctBy { Triple(it.width, it.height, it.fps) }
+    }
+
+    private fun highSpeedProfiles(map: StreamConfigurationMap, characteristics: CameraCharacteristics): List<CameraProfile> {
+        val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.toSet().orEmpty()
+        if (!capabilities.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_CONSTRAINED_HIGH_SPEED_VIDEO)) {
+            return emptyList()
+        }
+        return map.highSpeedVideoSizes.flatMap { size ->
+            map.getHighSpeedVideoFpsRangesFor(size)
+                .filter { it.lower == 120 && it.upper == 120 }
+                .mapNotNull {
+                    val codec = encoders.codecFor(size) ?: return@mapNotNull null
+                    CameraProfile(size.width, size.height, 120, highSpeed = true, codec = codec)
+                }
+        }
+            .filter { it.width == 1920 && it.height == 1080 }
+            .sortedWith(compareByDescending<CameraProfile> { it.width.toLong() * it.height }.thenByDescending { it.fps })
+            .distinctBy { Triple(it.width, it.height, it.fps) }
+    }
+
+    private fun containsFps(ranges: List<Range<Int>>, fps: Int): Boolean = ranges.any { it.lower <= fps && it.upper >= fps }
+
+    private fun whiteBalanceModes(characteristics: CameraCharacteristics?): List<String> {
+        val available = characteristics?.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)?.toSet().orEmpty()
+        return buildList {
+            if (available.contains(CameraMetadata.CONTROL_AWB_MODE_AUTO)) add("Auto")
+            if (available.contains(CameraMetadata.CONTROL_AWB_MODE_DAYLIGHT)) add("Daylight")
+            if (available.contains(CameraMetadata.CONTROL_AWB_MODE_CLOUDY_DAYLIGHT)) add("Cloudy")
+            if (available.contains(CameraMetadata.CONTROL_AWB_MODE_INCANDESCENT)) add("Incandescent")
+            if (available.contains(CameraMetadata.CONTROL_AWB_MODE_FLUORESCENT)) add("Fluorescent")
+        }.ifEmpty { listOf("Auto") }
+    }
+
+    private fun canReachFps(map: StreamConfigurationMap, size: Size, fps: Int): Boolean = try {
+        val minimumDurationNs = map.getOutputMinFrameDuration(SurfaceTexture::class.java, size)
+        minimumDurationNs == 0L || minimumDurationNs <= 1_000_000_000L / fps
+    } catch (_: IllegalArgumentException) {
+        false
+    }
+
+    fun asJson(capabilities: CameraCapabilities): JSONObject = JSONObject().apply {
+        put("type", "capabilities")
+        put("deviceName", capabilities.deviceName)
+        put("exposureMin", capabilities.exposureMin)
+        put("exposureMax", capabilities.exposureMax)
+        put("whiteBalanceModes", JSONArray(capabilities.whiteBalanceModes))
+        put("cameras", JSONArray().apply {
+            capabilities.cameras.forEach { camera ->
+                put(JSONObject().apply {
+                    put("id", camera.id)
+                    put("name", camera.name)
+                    put("maxZoom", camera.maxZoom)
+                    put("hasFlash", camera.hasFlash)
+                    put("profiles", JSONArray().apply {
+                        camera.profiles.forEach { profile ->
+                            put(JSONObject().apply {
+                                put("width", profile.width)
+                                put("height", profile.height)
+                                put("fps", profile.fps)
+                                put("highSpeed", profile.highSpeed)
+                                put("codec", profile.codec)
+                            })
+                        }
+                    })
+                })
+            }
+        })
+    }
+}
+
+private class VideoEncoderProbe {
+    private val h264 = encoderFor(MediaFormat.MIMETYPE_VIDEO_AVC)
+    private val h265 = encoderFor(MediaFormat.MIMETYPE_VIDEO_HEVC)
+
+    fun codecFor(size: Size): String? = when {
+        supports(h264, MediaFormat.MIMETYPE_VIDEO_AVC, size) -> "h264"
+        supports(h265, MediaFormat.MIMETYPE_VIDEO_HEVC, size) -> "h265"
+        else -> null
+    }
+
+    private fun encoderFor(mime: String): MediaCodecInfo? = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+        .firstOrNull { it.isEncoder && it.supportedTypes.any { supported -> supported.equals(mime, ignoreCase = true) } }
+
+    private fun supports(info: MediaCodecInfo?, mime: String, size: Size): Boolean = try {
+        info?.getCapabilitiesForType(mime)?.videoCapabilities?.isSizeSupported(size.width, size.height) == true
+    } catch (_: IllegalArgumentException) {
+        false
+    }
+}

@@ -1,0 +1,11 @@
+.gradle/
+**/build/
+**/bin/
+**/obj/
+.idea/
+local.properties
+*.user
+*.suo
+*.apk
+*.aab
+artifacts/
