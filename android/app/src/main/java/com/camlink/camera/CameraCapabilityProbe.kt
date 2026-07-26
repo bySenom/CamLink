@@ -54,17 +54,24 @@ class CameraCapabilityProbe(context: Context) {
         } else {
             characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
         }
+        val exposureRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE) ?: Range(0, 0)
         return CameraDescriptor(
             id = id,
             name = name,
             maxZoom = max(1f, zoom),
             hasFlash = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true,
-            profiles = recorderProfiles(id, map).ifEmpty { normalProfiles(map, characteristics) } + highSpeedProfiles(map, characteristics)
+            profiles = recorderProfiles(id, map).ifEmpty { normalProfiles(map, characteristics) } + highSpeedProfiles(map, characteristics),
+            exposureMin = exposureRange.lower,
+            exposureMax = exposureRange.upper,
+            whiteBalanceModes = whiteBalanceModes(characteristics),
+            focusModes = focusModes(characteristics)
         )
     }
 
     private fun cameraName(focalMm: Float): String = when {
-        focalMm <= 2.0f -> "Ultra-wide (${String.format("%.1f", focalMm)} mm)"
+        // The S22 reports its ultra-wide camera as 2.2 mm.  Keep this threshold
+        // wide enough to avoid selecting it as the default main ("Wide") lens.
+        focalMm <= 3.0f -> "Ultra-wide (${String.format("%.1f", focalMm)} mm)"
         focalMm >= 6.0f -> "Telephoto (${String.format("%.1f", focalMm)} mm)"
         else -> "Wide (${String.format("%.1f", focalMm)} mm)"
     }
@@ -144,6 +151,15 @@ class CameraCapabilityProbe(context: Context) {
             if (available.contains(CameraMetadata.CONTROL_AWB_MODE_INCANDESCENT)) add("Incandescent")
             if (available.contains(CameraMetadata.CONTROL_AWB_MODE_FLUORESCENT)) add("Fluorescent")
         }.ifEmpty { listOf("Auto") }
+    }
+
+    private fun focusModes(characteristics: CameraCharacteristics): List<Int> {
+        val available = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)?.toSet().orEmpty()
+        return buildList {
+            if (available.contains(CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO)) add(0)
+            if (available.contains(CameraMetadata.CONTROL_AF_MODE_AUTO)) add(1)
+            if (available.contains(CameraMetadata.CONTROL_AF_MODE_OFF)) add(2)
+        }.ifEmpty { listOf(0) }
     }
 
     private fun canReachFps(map: StreamConfigurationMap, size: Size, fps: Int): Boolean = try {

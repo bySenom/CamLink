@@ -231,7 +231,7 @@ class MainActivity : Activity(), HubClient.Listener {
         var zoomRatio = 1f
         var exposureEv = 0
         var whiteBalanceIndex = 0
-        var focusMode = 0
+        var focusMode = defaultCamera.focusModes.firstOrNull() ?: 0
         val toolbar = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(6), dp(6), dp(6), dp(6))
@@ -275,8 +275,15 @@ class MainActivity : Activity(), HubClient.Listener {
                 selectedCamera = camera
                 selectedProfile = camera.defaultLiveProfile()
                 zoomRatio = 1f
+                exposureEv = 0
+                whiteBalanceIndex = 0
+                focusMode = camera.focusModes.firstOrNull() ?: 0
                 torch.isEnabled = camera.hasFlash
                 updateTorchButton(false)
+                applyCameraCommand("setZoom", zoomRatio)
+                applyCameraCommand("setExposure", exposureEv)
+                applyCameraCommand("setWhiteBalance", "Auto")
+                applyCameraCommand("setFocusMode", focusMode)
                 startSelectedCamera()
             }
         }
@@ -289,15 +296,17 @@ class MainActivity : Activity(), HubClient.Listener {
             }
         }
         whiteBalance.setOnClickListener {
-            showChoiceDialog("White balance", detectedCapabilities.whiteBalanceModes, whiteBalanceIndex) { selected ->
-                whiteBalanceIndex = detectedCapabilities.whiteBalanceModes.indexOf(selected)
+            val modes = (selectedCamera ?: defaultCamera).whiteBalanceModes
+            showChoiceDialog("White balance", modes, whiteBalanceIndex) { selected ->
+                whiteBalanceIndex = modes.indexOf(selected)
                 applyCameraCommand("setWhiteBalance", selected)
             }
         }
         focus.setOnClickListener {
-            val choices = listOf("Continuous video", "Auto focus", "Locked focus")
-            showChoiceDialog("Focus", choices, focusMode) { selected ->
-                focusMode = choices.indexOf(selected)
+            val supportedModes = (selectedCamera ?: defaultCamera).focusModes
+            val choices = supportedModes.map(::focusLabel)
+            showChoiceDialog("Focus", choices, supportedModes.indexOf(focusMode)) { selected ->
+                focusMode = supportedModes[choices.indexOf(selected)]
                 applyCameraCommand("setFocusMode", focusMode)
             }
         }
@@ -309,7 +318,8 @@ class MainActivity : Activity(), HubClient.Listener {
             }
         }
         exposure.setOnClickListener {
-            showSliderDialog("Exposure", detectedCapabilities.exposureMin, detectedCapabilities.exposureMax, exposureEv, { "$it EV" }) { value ->
+            val camera = selectedCamera ?: defaultCamera
+            showSliderDialog("Exposure", camera.exposureMin, camera.exposureMax, exposureEv, { "$it EV" }) { value ->
                 exposureEv = value
                 applyCameraCommand("setExposure", exposureEv)
             }
@@ -814,6 +824,12 @@ class MainActivity : Activity(), HubClient.Listener {
             connectStatus.text = message
             connectStatus.setTextColor(if (error) 0xffb00020.toInt() else 0xff1b5e20.toInt())
         }
+    }
+
+    private fun focusLabel(mode: Int): String = when (mode) {
+        1 -> "Auto focus"
+        2 -> "Locked focus"
+        else -> "Continuous video"
     }
 
     private fun startCameraService() {

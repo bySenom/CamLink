@@ -15,7 +15,12 @@ data class CameraDescriptor(
     val name: String,
     val maxZoom: Float,
     val hasFlash: Boolean,
-    val profiles: List<CameraProfile>
+    val profiles: List<CameraProfile>,
+    val exposureMin: Int,
+    val exposureMax: Int,
+    val whiteBalanceModes: List<String>,
+    /** 0 = continuous video, 1 = auto one-shot, 2 = focus locked. */
+    val focusModes: List<Int>
 ) {
     override fun toString(): String = name
 }

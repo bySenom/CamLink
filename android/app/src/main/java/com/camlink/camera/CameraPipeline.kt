@@ -45,6 +45,7 @@ class CameraPipeline(
     private var whiteBalance = "Auto"
     private var torch = false
     private var focusMode = 0
+    private var triggerAutoFocus = false
 
     val isStreaming: Boolean get() = session != null
 
@@ -147,6 +148,7 @@ class CameraPipeline(
             }
             "setFocusMode" -> {
                 focusMode = (value as? Number)?.toInt() ?: 0
+                triggerAutoFocus = focusMode == 1
                 applyControls()
             }
         }
@@ -291,6 +293,18 @@ class CameraPipeline(
         handler.post {
             val builder = requestBuilder ?: return@post
             applyControlsTo(builder)
+            val triggerFocus = triggerAutoFocus && configuration?.highSpeed != true
+            triggerAutoFocus = false
+            if (triggerFocus) {
+                try {
+                    builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+                    session?.capture(builder.build(), null, handler)
+                } catch (exception: Exception) {
+                    hub.sendStatus("Auto focus trigger was rejected: ${exception.message}", error = true)
+                } finally {
+                    builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+                }
+            }
             applyRepeatingRequest()
         }
     }
@@ -298,21 +312,40 @@ class CameraPipeline(
     private fun applyControlsTo(builder: CaptureRequest.Builder) {
         val chars = characteristics ?: return
         val streamConfig = configuration ?: return
-        val exposureRange = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
-        builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, exposureRange?.clamp(exposure) ?: 0)
-        builder.set(CaptureRequest.FLASH_MODE, if (torch && chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
-        builder.set(CaptureRequest.CONTROL_AWB_MODE, when (whiteBalance) {
+        val availableAwb = chars.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)?.toSet().orEmpty()
+        val requestedAwb = when (whiteBalance) {
             "Daylight" -> CaptureRequest.CONTROL_AWB_MODE_DAYLIGHT
             "Cloudy" -> CaptureRequest.CONTROL_AWB_MODE_CLOUDY_DAYLIGHT
             "Incandescent" -> CaptureRequest.CONTROL_AWB_MODE_INCANDESCENT
             "Fluorescent" -> CaptureRequest.CONTROL_AWB_MODE_FLUORESCENT
             else -> CaptureRequest.CONTROL_AWB_MODE_AUTO
-        })
-        builder.set(CaptureRequest.CONTROL_AF_MODE, when (focusMode) {
+        }
+        val availableAf = chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)?.toSet().orEmpty()
+        val requestedAf = when (focusMode) {
             1 -> CaptureRequest.CONTROL_AF_MODE_AUTO
             2 -> CaptureRequest.CONTROL_AF_MODE_OFF
             else -> CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
-        })
+        }
+        val appliedAf = when {
+            availableAf.contains(requestedAf) -> requestedAf
+            availableAf.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) -> CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+            availableAf.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) -> CaptureRequest.CONTROL_AF_MODE_AUTO
+            availableAf.contains(CaptureRequest.CONTROL_AF_MODE_OFF) -> CaptureRequest.CONTROL_AF_MODE_OFF
+            else -> CaptureRequest.CONTROL_AF_MODE_OFF
+        }
+        val exposureRange = chars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+        val appliedExposure = exposureRange?.clamp(exposure) ?: 0
+        builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+        builder.set(CaptureRequest.CONTROL_AE_LOCK, false)
+        builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, appliedExposure)
+        builder.set(CaptureRequest.FLASH_MODE, if (torch && chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
+        builder.set(CaptureRequest.CONTROL_AWB_LOCK, false)
+        builder.set(
+            CaptureRequest.CONTROL_AWB_MODE,
+            if (availableAwb.contains(requestedAwb)) requestedAwb else CaptureRequest.CONTROL_AWB_MODE_AUTO
+        )
+        builder.set(CaptureRequest.CONTROL_AF_MODE, appliedAf)
+        builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val maxZoom = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)?.upper ?: 1f
             builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom.coerceIn(1f, maxZoom))
