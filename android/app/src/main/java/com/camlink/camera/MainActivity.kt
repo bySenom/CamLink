@@ -8,6 +8,8 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.SurfaceTexture
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.Build
 import android.os.Bundle
 import android.text.TextUtils
@@ -27,6 +29,7 @@ import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.Spinner
 import android.widget.TextView
+import android.util.Log
 import org.json.JSONObject
 import kotlin.math.roundToInt
 
@@ -49,9 +52,20 @@ class MainActivity : Activity(), HubClient.Listener {
     private var waitingForSmartUsbFallback = false
     private var discoveringLanHub = false
     private var validatingProfiles = false
+    private lateinit var protectionStore: ProtectionSettingsStore
+    private lateinit var protectionController: ProtectionController
+    private var protectionSettings = ProtectionSettings.preset(ProtectionProfile.BALANCED)
+    private var healthMonitor: DeviceHealthMonitor? = null
+    private var latestHealthState: DeviceHealthState? = null
+    private var originalProfile: CameraProfile? = null
+    private var pendingProtectionRollback: CameraProfile? = null
+    private var handlingPipelineFailure = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        protectionStore = ProtectionSettingsStore(this)
+        protectionSettings = protectionStore.load()
+        protectionController = ProtectionController(protectionSettings)
         setContentView(createConnectContent())
         requestCameraPermissionIfNeeded()
         checkForUpdates(showNoUpdate = false)
@@ -62,6 +76,8 @@ class MainActivity : Activity(), HubClient.Listener {
         restoreSystemBars()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         hub.close()
+        healthMonitor?.stop()
+        healthMonitor = null
         pipeline?.release()
         stopService(Intent(this, CamLinkCameraService::class.java))
         super.onDestroy()
@@ -101,6 +117,10 @@ class MainActivity : Activity(), HubClient.Listener {
         root.addView(Button(this).apply {
             text = "Validate camera profiles"
             setOnClickListener { validateCameraProfiles() }
+        })
+        root.addView(Button(this).apply {
+            text = "Protection settings"
+            setOnClickListener { showProtectionSettings() }
         })
         root.addView(Button(this).apply {
             text = "Check for updates"
@@ -193,6 +213,26 @@ class MainActivity : Activity(), HubClient.Listener {
         )
     }
 
+    private fun showProtectionSettings() {
+        ProtectionSettingsDialog(this, protectionSettings) { updated ->
+            protectionStore.save(updated).onSuccess { saved ->
+                protectionSettings = saved
+                protectionController.updateSettings(saved)
+                hub.sendProtectionConfiguration(saved)
+                val message = "Protection settings saved locally (${saved.profile.name})."
+                if (cameraMode) {
+                    hub.sendStatus(message)
+                    updateCameraHealthUi(latestHealthState)
+                } else {
+                    setConnectStatus(message)
+                }
+            }.onFailure { error ->
+                if (cameraMode) hub.sendStatus("Protection settings rejected: ${error.message}", error = true)
+                else setConnectStatus("Protection settings rejected: ${error.message}", true)
+            }
+        }.show()
+    }
+
     /** Runs only from the connection screen, so it never competes with the live Camera2 pipeline. */
     private fun validateCameraProfiles() {
         if (!hasCameraPermission()) {
@@ -263,6 +303,9 @@ class MainActivity : Activity(), HubClient.Listener {
         capabilities = detectedCapabilities
         selectedCamera = defaultCamera
         selectedProfile = defaultProfile
+        originalProfile = defaultProfile
+        pendingProtectionRollback = null
+        protectionController.reset()
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
@@ -308,6 +351,7 @@ class MainActivity : Activity(), HubClient.Listener {
         val zoom = iconButton("⌕", "Zoom")
         val exposure = iconButton("±", "Exposure")
         val torch = iconButton("✦", "Torch / fill light")
+        val protection = iconButton("◇", "Protection settings")
         val dim = iconButton("◐", "Dim screen without locking")
         val disconnect = iconButton("×", "Disconnect", destructive = true)
         fun updateTorchButton(enabled: Boolean) {
@@ -318,7 +362,7 @@ class MainActivity : Activity(), HubClient.Listener {
         torch.isEnabled = defaultCamera.hasFlash
         updateTorchButton(false)
 
-        listOf(lens, profile, whiteBalance, focus, zoom, exposure, torch, dim, disconnect).forEach(::addTool)
+        listOf(lens, profile, whiteBalance, focus, zoom, exposure, torch, protection, dim, disconnect).forEach(::addTool)
         root.addView(toolbar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
             setMargins(0, 0, 0, dp(16))
         })
@@ -332,6 +376,7 @@ class MainActivity : Activity(), HubClient.Listener {
                 if (camera.id == selectedCamera?.id) return@showChoiceDialog
                 selectedCamera = camera
                 selectedProfile = camera.defaultLiveProfile()
+                originalProfile = selectedProfile
                 zoomRatio = 1f
                 exposureEv = 0
                 whiteBalanceIndex = 0
@@ -350,6 +395,7 @@ class MainActivity : Activity(), HubClient.Listener {
             showChoiceDialog("Video profile", camera.profiles, camera.profiles.indexOf(selectedProfile)) { selected ->
                 if (selected == selectedProfile) return@showChoiceDialog
                 selectedProfile = selected
+                originalProfile = selected
                 startSelectedCamera()
             }
         }
@@ -387,6 +433,7 @@ class MainActivity : Activity(), HubClient.Listener {
             updateTorchButton(!torch.isSelected)
             applyCameraCommand("setTorch", torch.isSelected)
         }
+        protection.setOnClickListener { showProtectionSettings() }
         dim.setOnClickListener { setDisplayDimmed(true) }
         disconnect.setOnClickListener { returnToConnectScreen() }
 
@@ -496,8 +543,31 @@ class MainActivity : Activity(), HubClient.Listener {
         })
 
         pipeline?.release()
-        pipeline = CameraPipeline(this, cameraPreview, hub)
+        pipeline = CameraPipeline(this, cameraPreview, hub, object : CameraPipeline.Listener {
+            override fun onStreamStarted(config: StreamConfiguration, bitrateMbps: Float) {
+                runOnUiThread {
+                    val profileInfo = config.asHealthProfile()
+                    healthMonitor?.updateProfiles(requested = profileInfo, active = profileInfo)
+                    healthMonitor?.updateStreamingMetrics(latestHealthState?.actualFps, latestHealthState?.droppedFrames, latestHealthState?.recentDroppedFrames, bitrateMbps)
+                    hub.sendStreamProfile("active", profileInfo, profileInfo)
+                    pendingProtectionRollback = null
+                    handlingPipelineFailure = false
+                    updateCameraHealthUi(latestHealthState)
+                }
+            }
+
+            override fun onStreamFailed(config: StreamConfiguration, message: String) {
+                runOnUiThread { handlePipelineFailure(config, message) }
+            }
+
+            override fun onStreamMetrics(metrics: StreamMetrics) {
+                runOnUiThread {
+                        healthMonitor?.updateStreamingMetrics(metrics.actualFps, metrics.droppedFrames, metrics.recentDroppedFrames, metrics.activeBitrateMbps)
+                }
+            }
+        })
         setContentView(root)
+        startHealthMonitoring()
 
         updatingControls = true
         cameraSpinner.adapter = darkSpinnerAdapter(detectedCapabilities.cameras)
@@ -739,12 +809,177 @@ class MainActivity : Activity(), HubClient.Listener {
         spinner.setSelection(camera.profiles.indexOf(selected).coerceAtLeast(0))
     }
 
-    private fun startSelectedCamera() {
+    private fun startHealthMonitoring() {
+        val monitor = DeviceHealthMonitor(this)
+        healthMonitor?.stop()
+        healthMonitor = monitor
+        monitor.updateProfiles(originalProfile?.asHealthProfile(), latestHealthState?.activeProfile)
+        monitor.start(object : DeviceHealthMonitor.Listener {
+            override fun onHealthState(state: DeviceHealthState, immediate: Boolean) {
+                runOnUiThread { handleHealthState(state, immediate) }
+            }
+        })
+    }
+
+    private fun handleHealthState(rawState: DeviceHealthState, immediate: Boolean) {
+        if (!cameraMode) return
+        val decision = protectionController.evaluate(rawState)
+        if (decision != null) applyProtectionDecision(decision, rawState)
+        val state = rawState.copy(activeProtectionAction = protectionController.activeAction())
+        healthMonitor?.updateProtectionAction(state.activeProtectionAction)
+        latestHealthState = state
+        updateCameraHealthUi(state)
+        // Health data remains deliberately rate-limited by DeviceHealthMonitor. A thermal
+        // status change is emitted immediately; routine snapshots are emitted once/second.
+        hub.sendHealth(state)
+    }
+
+    private fun applyProtectionDecision(decision: ProtectionDecision, state: DeviceHealthState) {
+        val now = state.timestampMs
+        fun announce(message: String, error: Boolean = false) {
+            Log.i("CamLinkProtection", message)
+            if (protectionSettings.forwardWarningsToHub) hub.sendStatus(message, error)
+            if (protectionSettings.warningsEnabled && protectionSettings.audibleWarnings) {
+                runCatching {
+                    ToneGenerator(AudioManager.STREAM_NOTIFICATION, 65).also { tone ->
+                        tone.startTone(ToneGenerator.TONE_PROP_BEEP, 120)
+                        window.decorView.postDelayed({ tone.release() }, 150L)
+                    }
+                }
+            }
+        }
+
+        when (decision.action) {
+            ProtectionAction.NONE -> Unit
+            ProtectionAction.INFORM -> if (protectionSettings.warningsEnabled) announce(decision.reason)
+            ProtectionAction.REDUCE_BITRATE -> {
+                announce("Protection action scheduled: reduce bitrate by ${protectionSettings.bitrateReductionPercent}%. ${decision.reason}")
+                protectionController.recordApplied(decision, now)
+                healthMonitor?.updateProtectionAction(decision.action)
+                pipeline?.reduceBitrate(protectionSettings.bitrateReductionPercent, protectionSettings.minimumBitrateMbps) { applied, bitrate ->
+                    runOnUiThread {
+                        healthMonitor?.updateStreamingMetrics(latestHealthState?.actualFps, latestHealthState?.droppedFrames, latestHealthState?.recentDroppedFrames, bitrate)
+                        if (!applied) {
+                            announce("Dynamic bitrate change was unavailable; requesting FPS fallback.")
+                            applyProtectionFallback(ProtectionAction.REDUCE_FPS, "Encoder rejected dynamic bitrate change.", now)
+                        }
+                    }
+                }
+            }
+            ProtectionAction.REDUCE_FPS,
+            ProtectionAction.REDUCE_RESOLUTION -> {
+                protectionController.recordApplied(decision, now)
+                healthMonitor?.updateProtectionAction(decision.action)
+                applyProtectionFallback(decision.action, decision.reason, now)
+            }
+            ProtectionAction.RESTORE_QUALITY -> {
+                val restore = originalProfile
+                if (restore != null && restore != selectedProfile) {
+                    announce("Protection recovery requested: restoring ${restore.width}x${restore.height}@${restore.fps}.")
+                    protectionController.recordApplied(decision, now)
+                    selectedProfile = restore
+                    startSelectedCamera(protectionChange = true)
+                }
+            }
+            ProtectionAction.STOP_STREAM,
+            ProtectionAction.RELEASE_RESOURCES -> {
+                protectionController.recordApplied(decision, now)
+                val release = decision.action == ProtectionAction.RELEASE_RESOURCES
+                announce(if (release) "Critical thermal status: releasing camera and encoder. ${decision.reason}" else "Critical condition: stopping stream. ${decision.reason}", error = true)
+                hub.sendStreamProfile("stopping", originalProfile?.asHealthProfile(), state.activeProfile)
+                returnToConnectScreen("Protection stopped the stream safely. ${decision.reason}", true)
+            }
+        }
+    }
+
+    private fun applyProtectionFallback(action: ProtectionAction, reason: String, now: Long) {
+        val current = selectedProfile ?: return
+        val fallback = findProtectionFallback(action, current)
+        if (fallback == null) {
+            hub.sendStatus("Protection fallback unavailable for ${current.width}x${current.height}@${current.fps}: $reason", error = true)
+            return
+        }
+        pendingProtectionRollback = current
+        selectedProfile = fallback
+        val requested = originalProfile?.asHealthProfile()
+        hub.sendStatus("Profile fallback requested: ${current.width}x${current.height}@${current.fps} -> ${fallback.width}x${fallback.height}@${fallback.fps}. $reason")
+        hub.sendStreamProfile("switchRequested", requested, current.asHealthProfile())
+        healthMonitor?.updateProfiles(requested, current.asHealthProfile())
+        startSelectedCamera(protectionChange = true)
+    }
+
+    private fun findProtectionFallback(action: ProtectionAction, current: CameraProfile): CameraProfile? {
+        val camera = selectedCamera ?: return null
+        val supported = camera.profiles
+            .filter { !it.highSpeed && it.verification != ProfileVerification.UNSUPPORTED }
+            .let { profiles -> profiles.filter { it.codec == current.codec }.ifEmpty { profiles } }
+        return when (action) {
+            ProtectionAction.REDUCE_FPS -> {
+                val desired = protectionSettings.fpsFallbackOrder.filter { it < current.fps }
+                desired.firstNotNullOfOrNull { fps ->
+                    supported.filter { it.width == current.width && it.height == current.height && it.fps <= fps }
+                        .maxByOrNull { it.fps }
+                } ?: supported.filter { it.width == current.width && it.height == current.height && it.fps < current.fps }
+                    .maxByOrNull { it.fps }
+                    ?: findProtectionFallback(ProtectionAction.REDUCE_RESOLUTION, current)
+            }
+            ProtectionAction.REDUCE_RESOLUTION -> {
+                val desiredHeights = protectionSettings.resolutionFallbackHeights.filter { it < current.height }
+                desiredHeights.firstNotNullOfOrNull { height ->
+                    supported.filter { it.height <= height && it.height < current.height && it.fps <= current.fps }
+                        .maxWithOrNull(compareBy<CameraProfile> { it.height }.thenBy { it.fps })
+                } ?: supported.filter { it.height < current.height && it.fps <= current.fps }
+                    .maxWithOrNull(compareBy<CameraProfile> { it.height }.thenBy { it.fps })
+            }
+            else -> null
+        }
+    }
+
+    private fun handlePipelineFailure(config: StreamConfiguration, message: String) {
+        if (handlingPipelineFailure) return
+        val rollback = pendingProtectionRollback ?: run {
+            cameraStatus?.text = "⚠  $message"
+            return
+        }
+        handlingPipelineFailure = true
+        pendingProtectionRollback = null
+        hub.sendStatus("Profile fallback failed; restoring ${rollback.width}x${rollback.height}@${rollback.fps}.", error = true)
+        selectedProfile = rollback
+        startSelectedCamera(protectionChange = true)
+    }
+
+    private fun updateCameraHealthUi(state: DeviceHealthState?) {
+        val profile = state?.activeProfile ?: selectedProfile?.asHealthProfile()
+        val fps = state?.actualFps?.let { String.format("%.2f FPS", it) } ?: "-- FPS"
+        val temperature = state?.batteryTemperatureCelsius?.let { "Akku ${String.format("%.1f", it)} °C" } ?: "Temperatur: –"
+        val thermals = state?.thermalStatusLabel ?: "Nicht verfügbar"
+        val warning = when (state?.thermalStatus) {
+            ThermalStatus.CRITICAL, ThermalStatus.EMERGENCY, ThermalStatus.SHUTDOWN -> "⚠ "
+            else -> "● "
+        }
+        cameraStatus?.text = "$warning${profile?.height ?: "--"}p · ${profile?.fps ?: "--"} fps  ·  $fps  ·  $temperature  ·  Thermik: $thermals"
+        val color = when (state?.thermalStatus) {
+            ThermalStatus.LIGHT -> 0xffffd54f.toInt()
+            ThermalStatus.MODERATE -> 0xffffa726.toInt()
+            ThermalStatus.SEVERE -> 0xffef5350.toInt()
+            ThermalStatus.CRITICAL, ThermalStatus.EMERGENCY, ThermalStatus.SHUTDOWN -> 0xffff5252.toInt()
+            else -> Color.WHITE
+        }
+        cameraStatus?.setTextColor(color)
+    }
+
+    private fun CameraProfile.asHealthProfile() = HealthStreamProfile(width, height, fps, codec)
+    private fun StreamConfiguration.asHealthProfile() = HealthStreamProfile(width, height, fps, codec)
+
+    private fun startSelectedCamera(protectionChange: Boolean = false) {
         val camera = selectedCamera ?: return
         val profile = selectedProfile ?: return
         val config = StreamConfiguration(camera.id, profile.width, profile.height, profile.fps, profile.highSpeed, profile.codec)
+        if (!protectionChange) originalProfile = profile
+        val requested = originalProfile?.asHealthProfile() ?: profile.asHealthProfile()
+        healthMonitor?.updateProfiles(requested, latestHealthState?.activeProfile)
         (preview as? AspectRatioTextureView)?.setAspectRatio(profile.width, profile.height)
-        cameraStatus?.text = "●  ${profile.height}p  ·  ${profile.fps} fps"
+        updateCameraHealthUi(latestHealthState)
         startCameraService()
         val cameraPreview = preview ?: return
         val start = { pipeline?.start(config) }
@@ -779,12 +1014,18 @@ class MainActivity : Activity(), HubClient.Listener {
         pipeline?.stop()
         pipeline?.release()
         pipeline = null
+        healthMonitor?.stop()
+        healthMonitor = null
+        latestHealthState = null
+        pendingProtectionRollback = null
+        handlingPipelineFailure = false
         preview = null
         stopCameraService()
         hub.close()
         capabilities = null
         selectedCamera = null
         selectedProfile = null
+        originalProfile = null
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         restoreSystemBars()
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
@@ -830,6 +1071,23 @@ class MainActivity : Activity(), HubClient.Listener {
             when (command.optString("name")) {
                 "start" -> startCameraService()
                 "stop" -> stopCameraService()
+                "getProtectionConfig" -> hub.sendProtectionConfiguration(protectionSettings)
+                "setProtectionConfig" -> {
+                    val config = command.optJSONObject("value")
+                    if (config == null) {
+                        hub.sendProtectionConfigurationAck(false, null, "Protection configuration must be a JSON object.")
+                    } else {
+                        val candidate = ProtectionSettingsJson.fromJson(config, protectionSettings)
+                        protectionStore.save(candidate).onSuccess { saved ->
+                            protectionSettings = saved
+                            protectionController.updateSettings(saved)
+                            hub.sendProtectionConfigurationAck(true, saved)
+                            hub.sendStatus("Protection settings accepted from Windows Hub.")
+                        }.onFailure { error ->
+                            hub.sendProtectionConfigurationAck(false, null, error.message ?: "Invalid protection configuration.")
+                        }
+                    }
+                }
             }
             pipeline?.applyCommand(command)
         }
@@ -842,6 +1100,7 @@ class MainActivity : Activity(), HubClient.Listener {
                 val capabilityProbe = CameraCapabilityProbe(this)
                 val detectedCapabilities = capabilityProbe.inspect()
                 hub.send(capabilityProbe.asJson(detectedCapabilities))
+                hub.sendProtectionConfiguration(protectionSettings)
                 runOnUiThread { showCameraMode(detectedCapabilities, endpoint) }
             } catch (exception: Exception) {
                 runOnUiThread { setConnectStatus("Camera capability scan failed: ${exception.message}", true) }

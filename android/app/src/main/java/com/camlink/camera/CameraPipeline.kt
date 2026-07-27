@@ -14,6 +14,7 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Range
@@ -22,12 +23,27 @@ import android.view.TextureView
 import org.json.JSONObject
 import java.nio.ByteBuffer
 import kotlin.math.max
+import kotlin.math.roundToLong
+
+data class StreamMetrics(
+    val actualFps: Float?,
+    val droppedFrames: Long,
+    val recentDroppedFrames: Long,
+    val activeBitrateMbps: Float,
+    val activeConfiguration: StreamConfiguration
+)
 
 class CameraPipeline(
     context: Context,
     private val previewView: TextureView,
-    private val hub: HubClient
+    private val hub: HubClient,
+    private val listener: Listener? = null
 ) {
+    interface Listener {
+        fun onStreamStarted(config: StreamConfiguration, bitrateMbps: Float)
+        fun onStreamFailed(config: StreamConfiguration, message: String)
+        fun onStreamMetrics(metrics: StreamMetrics)
+    }
     private val manager = context.getSystemService(CameraManager::class.java)
     private val encoders = VideoEncoderProbe()
     private val cameraThread = HandlerThread("CamLinkCamera").apply { start() }
@@ -47,6 +63,12 @@ class CameraPipeline(
     private var torch = false
     private var focusMode = 0
     private var triggerAutoFocus = false
+    private var activeBitrate = 0
+    private var metricWindowStartPtsUs = Long.MIN_VALUE
+    private var metricWindowFrames = 0
+    private var previousFramePtsUs = Long.MIN_VALUE
+    private var droppedFrames = 0L
+    private var lastReportedDroppedFrames = 0L
 
     val isStreaming: Boolean get() = session != null
 
@@ -66,7 +88,9 @@ class CameraPipeline(
                 previewSurface = Surface(texture)
                 manager.openCamera(config.cameraId, cameraCallback, handler)
             } catch (exception: Exception) {
-                hub.sendStatus("Cannot start ${config.width}x${config.height}@${config.fps}: ${exception.message}", error = true)
+                val message = "Cannot start ${config.width}x${config.height}@${config.fps}: ${exception.message}"
+                hub.sendStatus(message, error = true)
+                listener?.onStreamFailed(config, message)
                 stop()
             }
         }
@@ -88,12 +112,39 @@ class CameraPipeline(
             previewSurface = null
             requestBuilder = null
             characteristics = null
+            resetMetrics()
         }
     }
 
     fun release() {
         stop()
         cameraThread.quitSafely()
+    }
+
+    /** Uses MediaCodec's public dynamic-bitrate parameter; no Camera2 session restart is needed. */
+    fun reduceBitrate(percent: Int, minimumMbps: Int, onComplete: (Boolean, Float) -> Unit) {
+        handler.post {
+            val current = activeBitrate
+            val minimum = minimumMbps.coerceAtLeast(1) * 1_000_000
+            val target = max(minimum, (current * (100 - percent.coerceIn(1, 90)) / 100f).toInt())
+            if (current <= 0 || target >= current || encoder == null) {
+                onComplete(false, current / 1_000_000f)
+                return@post
+            }
+            try {
+                encoder?.setParameters(Bundle().apply {
+                    putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, target)
+                })
+                activeBitrate = target
+                val message = "Protection action applied: bitrate ${"%.1f".format(current / 1_000_000f)} Mbps -> ${"%.1f".format(target / 1_000_000f)} Mbps"
+                hub.sendStatus(message)
+                onComplete(true, target / 1_000_000f)
+            } catch (exception: Exception) {
+                val message = "Dynamic bitrate change was rejected: ${exception.message}"
+                hub.sendStatus(message, error = true)
+                onComplete(false, current / 1_000_000f)
+            }
+        }
     }
 
     fun applyCommand(command: JSONObject) {
@@ -159,6 +210,7 @@ class CameraPipeline(
         val selection = encoders.select(config.codec, android.util.Size(config.width, config.height), config.fps)
             ?: throw UnsupportedOperationException("No ${config.codec} encoder supports ${config.width}x${config.height}@${config.fps}.")
         val bitrate = chooseBitrate(config, selection)
+        activeBitrate = bitrate
         val mime = selection.mime
         val format = MediaFormat.createVideoFormat(mime, config.width, config.height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
@@ -206,6 +258,7 @@ class CameraPipeline(
                     output.position(info.offset)
                     output.limit(info.offset + info.size)
                     hub.sendVideoFrame(output.slice(), info.size, info.presentationTimeUs)
+                    recordEncodedFrame(info.presentationTimeUs)
                 }
             } catch (exception: Exception) {
                 hub.sendStatus("Encoder output error: ${exception.message}", error = true)
@@ -235,7 +288,10 @@ class CameraPipeline(
         }
 
         override fun onError(codec: MediaCodec, exception: MediaCodec.CodecException) {
-            hub.sendStatus("Video encoder error: ${exception.diagnosticInfo}", error = true)
+            val config = configuration
+            val message = "Video encoder error: ${exception.diagnosticInfo}"
+            hub.sendStatus(message, error = true)
+            if (config != null) listener?.onStreamFailed(config, message)
         }
     }
 
@@ -245,18 +301,25 @@ class CameraPipeline(
             try {
                 configureSession(camera)
             } catch (exception: Exception) {
-                hub.sendStatus("Cannot configure camera session: ${exception.message}", error = true)
+                val config = configuration
+                val message = "Cannot configure camera session: ${exception.message}"
+                hub.sendStatus(message, error = true)
+                if (config != null) listener?.onStreamFailed(config, message)
                 stop()
             }
         }
 
         override fun onDisconnected(camera: CameraDevice) {
+            val config = configuration
             hub.sendStatus("Camera disconnected", error = true)
+            if (config != null) listener?.onStreamFailed(config, "Camera disconnected")
             stop()
         }
 
         override fun onError(camera: CameraDevice, error: Int) {
+            val config = configuration
             hub.sendStatus("Camera error $error", error = true)
+            if (config != null) listener?.onStreamFailed(config, "Camera error $error")
             stop()
         }
     }
@@ -279,10 +342,13 @@ class CameraPipeline(
                     session = captureSession
                     applyRepeatingRequest()
                     hub.sendStatus("Camera streaming ${config.width}x${config.height} @ ${config.fps} fps (high-speed; focus/white balance may be device-managed)")
+                    listener?.onStreamStarted(config, activeBitrate / 1_000_000f)
                 }
 
                 override fun onConfigureFailed(captureSession: CameraCaptureSession) {
-                    hub.sendStatus("High-speed profile was rejected by the camera.", error = true)
+                    val message = "High-speed profile was rejected by the camera."
+                    hub.sendStatus(message, error = true)
+                    listener?.onStreamFailed(config, message)
                 }
             }, handler)
         } else {
@@ -291,10 +357,13 @@ class CameraPipeline(
                     session = captureSession
                     applyRepeatingRequest()
                     hub.sendStatus("Camera streaming ${config.width}x${config.height} @ ${config.fps} fps")
+                    listener?.onStreamStarted(config, activeBitrate / 1_000_000f)
                 }
 
                 override fun onConfigureFailed(captureSession: CameraCaptureSession) {
-                    hub.sendStatus("Camera profile was rejected by the device/encoder.", error = true)
+                    val message = "Camera profile was rejected by the device/encoder."
+                    hub.sendStatus(message, error = true)
+                    listener?.onStreamFailed(config, message)
                 }
             }, handler)
         }
@@ -389,6 +458,35 @@ class CameraPipeline(
     }
 
     private fun Range<Int>.clamp(value: Int): Int = value.coerceIn(lower, upper)
+
+    private fun recordEncodedFrame(presentationTimeUs: Long) {
+        val config = configuration ?: return
+        if (previousFramePtsUs != Long.MIN_VALUE && presentationTimeUs > previousFramePtsUs) {
+            val expectedFrameUs = 1_000_000.0 / config.fps.coerceAtLeast(1)
+            val elapsedFrames = ((presentationTimeUs - previousFramePtsUs) / expectedFrameUs).roundToLong()
+            if (elapsedFrames > 1) droppedFrames += elapsedFrames - 1
+        }
+        previousFramePtsUs = presentationTimeUs
+        if (metricWindowStartPtsUs == Long.MIN_VALUE) metricWindowStartPtsUs = presentationTimeUs
+        metricWindowFrames++
+        val windowUs = presentationTimeUs - metricWindowStartPtsUs
+        if (windowUs < 1_000_000L || metricWindowFrames < 2) return
+        val fps = ((metricWindowFrames - 1) * 1_000_000.0 / windowUs).toFloat()
+        val recentDrops = droppedFrames - lastReportedDroppedFrames
+        lastReportedDroppedFrames = droppedFrames
+        listener?.onStreamMetrics(StreamMetrics(fps, droppedFrames, recentDrops, activeBitrate / 1_000_000f, config))
+        metricWindowStartPtsUs = presentationTimeUs
+        metricWindowFrames = 1
+    }
+
+    private fun resetMetrics() {
+        activeBitrate = 0
+        metricWindowStartPtsUs = Long.MIN_VALUE
+        metricWindowFrames = 0
+        previousFramePtsUs = Long.MIN_VALUE
+        droppedFrames = 0L
+        lastReportedDroppedFrames = 0L
+    }
 
     private fun cropForZoom(sensor: Rect, zoom: Float): Rect {
         val width = (sensor.width() / zoom).toInt()

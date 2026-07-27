@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Diagnostics;
+using System.Text.Json;
 
 namespace CamLink.Desktop;
 
@@ -12,6 +13,8 @@ internal sealed class MainForm : Form
     private readonly RtspServer _rtsp;
     private readonly LanDiscoveryService _lanDiscovery = new(HubPort);
     private readonly Label _connectionStatus = new() { AutoSize = true, Text = "Hub stopped", ForeColor = Color.DarkRed };
+    private readonly Label _healthStatus = new() { AutoSize = true, Text = "FPS: – | Akku: – | Temperatur: – | Thermik: Nicht verfügbar", ForeColor = Color.DimGray, MaximumSize = new Size(760, 0) };
+    private readonly Label _protectionStatus = new() { AutoSize = true, Text = "Protection: waiting for phone configuration", ForeColor = Color.DimGray };
     private readonly Label _virtualCameraStatus = new() { AutoSize = true, Text = "Windows camera: OBS Virtual Camera (waiting for the phone stream)" };
     private readonly ComboBox _camera = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 270 };
     private readonly ComboBox _profile = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 270 };
@@ -24,14 +27,17 @@ internal sealed class MainForm : Form
     private readonly Button _stop = new() { Text = "Stop stream", AutoSize = true };
     private readonly Button _startVirtualCamera = new() { Text = "Start Windows camera", AutoSize = true };
     private readonly Button _checkUpdates = new() { Text = "Check for updates", AutoSize = true };
+    private readonly Button _editProtection = new() { Text = "Edit protection…", AutoSize = true };
+    private readonly ToolTip _toolTip = new();
     private PhoneCapabilities? _capabilities;
+    private ProtectionConfiguration? _protectionConfiguration;
     private bool _suppressEvents;
 
     public MainForm()
     {
         _rtsp = new RtspServer(_hub.Relay);
         Text = "CamLink – Android camera control";
-        MinimumSize = new Size(600, 620);
+        MinimumSize = new Size(600, 700);
         StartPosition = FormStartPosition.CenterScreen;
         Font = new Font("Segoe UI", 10);
 
@@ -41,6 +47,7 @@ internal sealed class MainForm : Form
         _stop.Click += async (_, _) => await SendAsync("stop");
         _startVirtualCamera.Click += (_, _) => StartWindowsCamera();
         _checkUpdates.Click += async (_, _) => await CheckForUpdatesAsync(interactive: true);
+        _editProtection.Click += async (_, _) => await EditProtectionAsync();
 
         _camera.SelectedIndexChanged += async (_, _) => await OnCameraChangedAsync();
         _profile.SelectedIndexChanged += async (_, _) => await OnProfileChangedAsync();
@@ -52,6 +59,17 @@ internal sealed class MainForm : Form
 
         var connectionPanel = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Top, FlowDirection = FlowDirection.LeftToRight, Padding = new Padding(14, 14, 14, 6) };
         connectionPanel.Controls.AddRange([startHub, _connectionStatus]);
+
+        var healthPanel = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Top, FlowDirection = FlowDirection.TopDown, WrapContents = false, Padding = new Padding(14, 4, 14, 4) };
+        healthPanel.Controls.Add(_healthStatus);
+        _toolTip.SetToolTip(_healthStatus, "Temperatur means battery temperature only. Thermik is Android's public thermal status. Thermal Headroom is shown in the detail tooltip only when Android makes it available.");
+
+        var protectionBox = new GroupBox { Text = "Phone protection", AutoSize = true, Dock = DockStyle.Top, Padding = new Padding(12) };
+        var protectionPanel = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false };
+        protectionPanel.Controls.Add(_protectionStatus);
+        protectionPanel.Controls.Add(new Label { AutoSize = true, MaximumSize = new Size(520, 0), Text = "The Android client is authoritative: it persists and applies protection locally even if this Hub disconnects. Edit opens the complete versioned configuration and the phone confirms accepted values." });
+        protectionPanel.Controls.Add(_editProtection);
+        protectionBox.Controls.Add(protectionPanel);
 
         var controls = new TableLayoutPanel
         {
@@ -82,8 +100,10 @@ internal sealed class MainForm : Form
 
         var root = new Panel { Dock = DockStyle.Fill, AutoScroll = true };
         root.Controls.Add(virtualCameraBox);
+        root.Controls.Add(protectionBox);
         root.Controls.Add(actions);
         root.Controls.Add(controls);
+        root.Controls.Add(healthPanel);
         root.Controls.Add(connectionPanel);
         Controls.Add(root);
 
@@ -99,6 +119,9 @@ internal sealed class MainForm : Form
         });
         _hub.CapabilitiesReceived += capabilities => Ui(() => LoadCapabilities(capabilities));
         _hub.StatusReceived += status => Ui(() => ShowPhoneStatus(status));
+        _hub.HealthReceived += health => Ui(() => ShowHealth(health));
+        _hub.ProtectionConfigurationReceived += configuration => Ui(() => ShowProtectionConfiguration(configuration, confirmed: true));
+        _hub.ProtectionConfigurationAcknowledged += acknowledgement => Ui(() => ShowProtectionAcknowledgement(acknowledgement));
         Shown += async (_, _) =>
         {
             await StartHubAsync();
@@ -291,6 +314,125 @@ internal sealed class MainForm : Form
         {
             ShowPhoneStatus(new DeviceStatus(exception.Message, true));
         }
+    }
+
+    private async Task EditProtectionAsync()
+    {
+        if (_protectionConfiguration is null)
+        {
+            await SendAsync("getProtectionConfig");
+            _protectionStatus.Text = "Protection: requested configuration from phone; open this editor again after it arrives.";
+            _protectionStatus.ForeColor = Color.DarkBlue;
+            return;
+        }
+        var initial = _protectionConfiguration.Json;
+        using var dialog = new Form
+        {
+            Text = "CamLink phone protection configuration",
+            StartPosition = FormStartPosition.CenterParent,
+            Size = new Size(720, 700),
+            MinimizeBox = false,
+            MaximizeBox = false
+        };
+        var explanation = new Label
+        {
+            AutoSize = true,
+            MaximumSize = new Size(660, 0),
+            Text = "This is the complete versioned configuration stored on the phone. Values are checked locally before sending and validated again by Android. Battery temperature limits are device-dependent user thresholds, not universal safety values."
+        };
+        var editor = new TextBox
+        {
+            Multiline = true,
+            AcceptsReturn = true,
+            AcceptsTab = true,
+            ScrollBars = ScrollBars.Both,
+            WordWrap = false,
+            Dock = DockStyle.Fill,
+            Font = new Font(FontFamily.GenericMonospace, 9),
+            Text = initial
+        };
+        var apply = new Button { Text = "Send validated configuration", DialogResult = DialogResult.OK, AutoSize = true };
+        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, AutoSize = true };
+        var buttons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Bottom, FlowDirection = FlowDirection.RightToLeft };
+        buttons.Controls.AddRange([cancel, apply]);
+        var root = new Panel { Dock = DockStyle.Fill, Padding = new Padding(14) };
+        root.Controls.Add(editor);
+        root.Controls.Add(buttons);
+        root.Controls.Add(explanation);
+        explanation.Dock = DockStyle.Top;
+        dialog.Controls.Add(root);
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+        if (!ProtectionConfiguration.TryValidate(editor.Text, out var error))
+        {
+            MessageBox.Show(this, error, "Invalid protection configuration", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        try
+        {
+            using var document = JsonDocument.Parse(editor.Text);
+            await _hub.SendCommandAsync("setProtectionConfig", document.RootElement.Clone());
+            _protectionStatus.Text = "Protection: waiting for Android confirmation…";
+            _protectionStatus.ForeColor = Color.DarkBlue;
+        }
+        catch (Exception exception)
+        {
+            ShowPhoneStatus(new DeviceStatus($"Could not send protection configuration: {exception.Message}", true));
+        }
+    }
+
+    private void ShowHealth(DeviceHealth health)
+    {
+        var fps = health.ActualFps is { } actual ? actual.ToString("0.00") : "–";
+        var battery = health.BatteryLevelPercent is { } level ? $"{level} %" : "–";
+        var temperature = health.BatteryTemperatureCelsius is { } temperatureCelsius
+            ? $"Akku: {temperatureCelsius:0.0} °C"
+            : "Temperatur: –";
+        var power = health.IsCharging ? $" | Laden: {health.ChargingSource}" : string.Empty;
+        var drops = health.DroppedFrames is { } dropped && dropped > 0 ? $" | Drops: {dropped}" : string.Empty;
+        var action = string.IsNullOrWhiteSpace(health.ActiveProtectionAction) ? string.Empty : $" | Schutz: {health.ActiveProtectionAction}";
+        _healthStatus.Text = $"FPS: {fps} | Akku: {battery} | {temperature} | Thermik: {health.ThermalStatusLabel}{power}{drops}{action}";
+        _healthStatus.ForeColor = health.ThermalStatus switch
+        {
+            >= 4 => Color.Crimson,
+            3 => Color.Red,
+            2 => Color.DarkOrange,
+            1 => Color.Goldenrod,
+            _ => Color.DarkGreen
+        };
+        var headroom = health.ThermalHeadroom is { } value ? $" Thermal Headroom: {value:0.00}." : " Thermal Headroom is unavailable on this Android version/device.";
+        _toolTip.SetToolTip(_healthStatus, $"Temperature is the battery temperature only; it is not a whole-device sensor. Android thermal status: {health.ThermalStatusLabel}.{headroom}");
+    }
+
+    private void ShowProtectionConfiguration(ProtectionConfiguration configuration, bool confirmed)
+    {
+        _protectionConfiguration = configuration;
+        var profile = "CUSTOM";
+        try
+        {
+            using var document = JsonDocument.Parse(configuration.Json);
+            if (document.RootElement.TryGetProperty("profile", out var value)) profile = value.GetString() ?? profile;
+        }
+        catch (JsonException)
+        {
+            // Keep the raw configuration available for diagnostics; Android owns validation.
+        }
+        _protectionStatus.Text = $"Protection: {profile} {(confirmed ? "confirmed by phone" : "pending")}";
+        _protectionStatus.ForeColor = Color.DarkGreen;
+    }
+
+    private void ShowProtectionAcknowledgement(ProtectionConfigurationAck acknowledgement)
+    {
+        if (acknowledgement.Accepted && acknowledgement.Configuration is { } configuration)
+        {
+            ShowProtectionConfiguration(configuration, confirmed: true);
+            return;
+        }
+        _protectionStatus.Text = $"Protection configuration rejected: {acknowledgement.Error ?? "unknown reason"}";
+        _protectionStatus.ForeColor = Color.DarkRed;
     }
 
     private void LoadCapabilities(PhoneCapabilities capabilities)

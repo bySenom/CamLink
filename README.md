@@ -19,6 +19,8 @@ In particular, do not assume that every S22 variant offers 8K/30 or 1080p/120 th
 
 Use **Validate camera profiles** in the Android connection screen to test each candidate locally and cache it as verified, unstable, or unsupported. See [camera-validation.md](docs/camera-validation.md) for the test procedure and Logcat filters.
 
+CamLink also has local Android health monitoring and configurable stream protection. It labels battery temperature correctly, shows Android's thermal status separately, and can reduce bitrate/FPS/resolution or stop safely without depending on the Hub. See [health-protection.md](docs/health-protection.md).
+
 ## Project layout
 
 ```text

@@ -16,6 +16,9 @@ internal sealed class HubServer : IAsyncDisposable
 
     public event Action<PhoneCapabilities>? CapabilitiesReceived;
     public event Action<DeviceStatus>? StatusReceived;
+    public event Action<DeviceHealth>? HealthReceived;
+    public event Action<ProtectionConfiguration>? ProtectionConfigurationReceived;
+    public event Action<ProtectionConfigurationAck>? ProtectionConfigurationAcknowledged;
     public event Action<string>? DeviceConnected;
     public event Action? DeviceDisconnected;
 
@@ -151,6 +154,21 @@ internal sealed class HubServer : IAsyncDisposable
             case "status":
                 StatusReceived?.Invoke(DeviceStatus.FromJson(root));
                 break;
+            case "health":
+                HealthReceived?.Invoke(DeviceHealth.FromJson(root));
+                break;
+            case "protectionConfig":
+                ProtectionConfigurationReceived?.Invoke(ProtectionConfiguration.FromJson(root));
+                break;
+            case "protectionConfigAck":
+                ProtectionConfigurationAcknowledged?.Invoke(ProtectionConfigurationAck.FromJson(root));
+                break;
+            case "streamProfile":
+            {
+                var streamEvent = root.TryGetProperty("event", out var eventName) ? eventName.GetString() ?? "changed" : "changed";
+                StatusReceived?.Invoke(new DeviceStatus($"Phone stream profile {streamEvent}.", false));
+                break;
+            }
             case "videoConfig":
                 _relay.SetConfig(
                     root.TryGetProperty("codec", out var codec) ? codec.GetString() ?? "h264" : "h264",

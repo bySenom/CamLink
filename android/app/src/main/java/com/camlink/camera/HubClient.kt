@@ -95,6 +95,58 @@ class HubClient(
         send(JSONObject().put("type", "status").put("message", message).put("error", error))
     }
 
+    /** Bounded by [DeviceHealthMonitor] to one regular message per second plus state changes. */
+    fun sendHealth(state: DeviceHealthState) {
+        send(JSONObject().apply {
+            put("type", "health")
+            put("schemaVersion", 1)
+            put("batteryLevelPercent", state.batteryLevelPercent)
+            put("batteryTemperatureCelsius", state.batteryTemperatureCelsius)
+            put("isCharging", state.isCharging)
+            put("chargingSource", state.chargingSource.name)
+            put("thermalStatus", state.thermalStatus)
+            put("thermalStatusLabel", state.thermalStatusLabel)
+            put("thermalHeadroom", state.thermalHeadroom)
+            put("actualFps", state.actualFps)
+            put("droppedFrames", state.droppedFrames)
+            put("recentDroppedFrames", state.recentDroppedFrames)
+            put("activeProtectionAction", state.activeProtectionAction?.name)
+            put("requestedProfile", state.requestedProfile?.asJson())
+            put("activeProfile", state.activeProfile?.asJson())
+            put("activeBitrateMbps", state.activeBitrateMbps)
+            put("timestampMs", state.timestampMs)
+        })
+    }
+
+    fun sendProtectionConfiguration(settings: ProtectionSettings) {
+        send(JSONObject().apply {
+            put("type", "protectionConfig")
+            put("schemaVersion", ProtectionSettings.SCHEMA_VERSION)
+            put("config", ProtectionSettingsJson.toJson(settings))
+        })
+    }
+
+    fun sendProtectionConfigurationAck(accepted: Boolean, settings: ProtectionSettings?, error: String? = null) {
+        send(JSONObject().apply {
+            put("type", "protectionConfigAck")
+            put("schemaVersion", ProtectionSettings.SCHEMA_VERSION)
+            put("accepted", accepted)
+            if (settings != null) put("config", ProtectionSettingsJson.toJson(settings))
+            if (error != null) put("error", error)
+        })
+    }
+
+    fun sendStreamProfile(event: String, requested: HealthStreamProfile?, active: HealthStreamProfile?) {
+        send(JSONObject().apply {
+            put("type", "streamProfile")
+            put("schemaVersion", 1)
+            put("event", event)
+            put("requestedProfile", requested?.asJson())
+            put("activeProfile", active?.asJson())
+            put("timestampMs", System.currentTimeMillis())
+        })
+    }
+
     fun sendVideoConfig(codec: String, sps: ByteArray, pps: ByteArray, vps: ByteArray?, fps: Int) {
         send(JSONObject().apply {
             put("type", "videoConfig")
@@ -238,4 +290,11 @@ class HubClient(
     }
 
     private data class Endpoint(val label: String, val host: String, val port: Int)
+
+    private fun HealthStreamProfile.asJson(): JSONObject = JSONObject().apply {
+        put("width", width)
+        put("height", height)
+        put("fps", fps)
+        put("codec", codec)
+    }
 }
