@@ -2,6 +2,7 @@ package com.camlink.camera
 
 import android.content.Context
 import android.graphics.Matrix
+import android.graphics.RectF
 import android.util.AttributeSet
 import android.view.TextureView
 import kotlin.math.max
@@ -13,11 +14,15 @@ class AspectRatioTextureView @JvmOverloads constructor(
 ) : TextureView(context, attrs) {
     private var frameWidth = 0
     private var frameHeight = 0
+    private var rotationDegrees = 0
 
-    fun setAspectRatio(width: Int, height: Int) {
-        if (width <= 0 || height <= 0 || (frameWidth == width && frameHeight == height)) return
+    fun setAspectRatio(width: Int, height: Int, rotationDegrees: Int = this.rotationDegrees) {
+        if (width <= 0 || height <= 0) return
+        val normalizedRotation = ((rotationDegrees % 360) + 360) % 360
+        if (frameWidth == width && frameHeight == height && this.rotationDegrees == normalizedRotation) return
         frameWidth = width
         frameHeight = height
+        this.rotationDegrees = normalizedRotation
         applyCenterCrop()
     }
 
@@ -32,12 +37,17 @@ class AspectRatioTextureView @JvmOverloads constructor(
 
     private fun applyCenterCrop() {
         if (frameWidth == 0 || frameHeight == 0 || width == 0 || height == 0) return
-        val scale = max(width.toFloat() / frameWidth, height.toFloat() / frameHeight)
-        val scaledWidth = frameWidth * scale
-        val scaledHeight = frameHeight * scale
-        setTransform(Matrix().apply {
+        val swapsAxes = rotationDegrees % 180 != 0
+        val rotatedWidth = if (swapsAxes) frameHeight else frameWidth
+        val rotatedHeight = if (swapsAxes) frameWidth else frameHeight
+        val scale = max(width.toFloat() / rotatedWidth, height.toFloat() / rotatedHeight)
+        val matrix = Matrix().apply {
             setScale(scale, scale)
-            postTranslate((width - scaledWidth) / 2f, (height - scaledHeight) / 2f)
-        })
+            postRotate(rotationDegrees.toFloat(), frameWidth * scale / 2f, frameHeight * scale / 2f)
+            val bounds = RectF(0f, 0f, frameWidth.toFloat(), frameHeight.toFloat())
+            mapRect(bounds)
+            postTranslate(width / 2f - bounds.centerX(), height / 2f - bounds.centerY())
+        }
+        setTransform(matrix)
     }
 }

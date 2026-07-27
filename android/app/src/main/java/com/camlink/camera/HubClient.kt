@@ -36,6 +36,8 @@ class HubClient(
     private var endpoint: Endpoint? = null
     @Volatile private var listener: Listener? = null
 
+    val isConnected: Boolean get() = connected.get()
+
     fun connectSmart(wifiHost: String, port: Int, listener: Listener) {
         val candidates = buildList {
             add(Endpoint("USB", "127.0.0.1", port))

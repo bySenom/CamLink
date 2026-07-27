@@ -63,6 +63,10 @@ class MainActivity : Activity(), HubClient.Listener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // The connection screen never owns a camera session or foreground service.
+        // This also clears an orphaned service from an interrupted earlier session.
+        cameraMode = false
+        stopCameraService()
         protectionStore = ProtectionSettingsStore(this)
         protectionSettings = protectionStore.load()
         protectionController = ProtectionController(protectionSettings)
@@ -368,8 +372,37 @@ class MainActivity : Activity(), HubClient.Listener {
         })
 
         pipeline?.release()
-        pipeline = CameraPipeline(this, cameraPreview, hub)
+        pipeline = CameraPipeline(this, cameraPreview, hub, object : CameraPipeline.Listener {
+            override fun onStreamStarted(config: StreamConfiguration, bitrateMbps: Float) {
+                runOnUiThread {
+                    val profileInfo = config.asHealthProfile()
+                    healthMonitor?.updateProfiles(requested = originalProfile?.asHealthProfile() ?: profileInfo, active = profileInfo)
+                    healthMonitor?.updateStreamingMetrics(latestHealthState?.actualFps, latestHealthState?.droppedFrames, latestHealthState?.recentDroppedFrames, bitrateMbps)
+                    hub.sendStreamProfile("active", originalProfile?.asHealthProfile() ?: profileInfo, profileInfo)
+                    pendingProtectionRollback = null
+                    handlingPipelineFailure = false
+                    updateCameraHealthUi(latestHealthState)
+                }
+            }
+
+            override fun onStreamFailed(config: StreamConfiguration, message: String) {
+                runOnUiThread { handlePipelineFailure(config, message) }
+            }
+
+            override fun onStreamMetrics(metrics: StreamMetrics) {
+                runOnUiThread {
+                    healthMonitor?.updateStreamingMetrics(metrics.actualFps, metrics.droppedFrames, metrics.recentDroppedFrames, metrics.activeBitrateMbps)
+                }
+            }
+
+            override fun onPreviewTransform(config: StreamConfiguration, rotationDegrees: Int) {
+                runOnUiThread {
+                    (preview as? AspectRatioTextureView)?.setAspectRatio(config.width, config.height, rotationDegrees)
+                }
+            }
+        })
         setContentView(root)
+        startHealthMonitoring()
 
         lens.setOnClickListener {
             showChoiceDialog("Lens", detectedCapabilities.cameras, detectedCapabilities.cameras.indexOf(selectedCamera)) { camera ->
@@ -972,6 +1005,10 @@ class MainActivity : Activity(), HubClient.Listener {
     private fun StreamConfiguration.asHealthProfile() = HealthStreamProfile(width, height, fps, codec)
 
     private fun startSelectedCamera(protectionChange: Boolean = false) {
+        if (!cameraMode || !hub.isConnected) {
+            if (cameraMode) returnToConnectScreen("Hub connection is not active; camera was not started.", true)
+            return
+        }
         val camera = selectedCamera ?: return
         val profile = selectedProfile ?: return
         val config = StreamConfiguration(camera.id, profile.width, profile.height, profile.fps, profile.highSpeed, profile.codec)
@@ -1150,6 +1187,7 @@ class MainActivity : Activity(), HubClient.Listener {
     }
 
     private fun startCameraService() {
+        if (!cameraMode || !hub.isConnected) return
         val intent = Intent(this, CamLinkCameraService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
     }

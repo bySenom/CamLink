@@ -43,6 +43,7 @@ class CameraPipeline(
         fun onStreamStarted(config: StreamConfiguration, bitrateMbps: Float)
         fun onStreamFailed(config: StreamConfiguration, message: String)
         fun onStreamMetrics(metrics: StreamMetrics)
+        fun onPreviewTransform(config: StreamConfiguration, rotationDegrees: Int) = Unit
     }
     private val manager = context.getSystemService(CameraManager::class.java)
     private val encoders = VideoEncoderProbe()
@@ -79,6 +80,7 @@ class CameraPipeline(
         handler.post {
             try {
                 characteristics = manager.getCameraCharacteristics(config.cameraId)
+                listener?.onPreviewTransform(config, previewRotationDegrees(requireNotNull(characteristics)))
                 prepareEncoder(config)
                 if (!previewView.isAvailable) {
                     throw IllegalStateException("Preview surface is not ready yet. Keep the CamLink app in the foreground and try again.")
@@ -458,6 +460,22 @@ class CameraPipeline(
     }
 
     private fun Range<Int>.clamp(value: Int): Int = value.coerceIn(lower, upper)
+
+    private fun previewRotationDegrees(chars: CameraCharacteristics): Int {
+        val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+        val displayDegrees = when (previewView.display?.rotation ?: Surface.ROTATION_0) {
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+        val front = chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
+        return if (front) {
+            (sensorOrientation + displayDegrees) % 360
+        } else {
+            (sensorOrientation - displayDegrees + 360) % 360
+        }
+    }
 
     private fun recordEncodedFrame(presentationTimeUs: Long) {
         val config = configuration ?: return
